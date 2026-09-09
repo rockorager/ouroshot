@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Debian 12 orb prerequisites. No compositor or other service is started here.
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+started=$SECONDS
+packages=(build-essential ca-certificates curl xz-utils pkg-config nasm
+    libpng-dev libva-dev libgbm-dev libdrm-dev libx264-dev
+    ffmpeg sway swaybg grim fonts-dejavu-core)
+missing=()
+for package in "${packages[@]}"; do
+    if [[ $(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true) != 'install ok installed' ]]; then
+        missing+=("$package")
+    fi
+done
+echo 'Checking system dependencies'
+if ((${#missing[@]})); then
+    sudo apt-get update -qq
+    sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}"
+fi
+echo "System dependencies ready (${SECONDS}s)"
+
+scratch=$(mktemp -d)
+trap 'rm -rf "$scratch"' EXIT
+
+echo 'Checking Zig 0.16.0'
+zig_prefix=/opt/zig-0.16.0
+if [[ ! -x $zig_prefix/zig ]] || [[ $($zig_prefix/zig version) != 0.16.0 ]]; then
+    case $(uname -m) in
+        x86_64) arch=x86_64; checksum=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00 ;;
+        aarch64) arch=aarch64; checksum=ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17 ;;
+        *) echo 'Unsupported Zig architecture' >&2; exit 1 ;;
+    esac
+    curl -fsSL --retry 3 "https://ziglang.org/download/0.16.0/zig-${arch}-linux-0.16.0.tar.xz" -o "$scratch/zig.tar.xz"
+    echo "$checksum  $scratch/zig.tar.xz" | sha256sum --check
+    tar -xJf "$scratch/zig.tar.xz" -C "$scratch"
+    sudo mkdir -p "$zig_prefix"
+    sudo cp -a "$scratch/zig-${arch}-linux-0.16.0/." "$zig_prefix/"
+fi
+sudo ln -sfn "$zig_prefix/zig" /usr/local/bin/zig
+echo "Zig ready (${SECONDS}s)"
+
+# Bookworm's FFmpeg 5 lacks AVBufferSrcParameters.color_space/color_range.
+# Build only the libraries/features ouroshot uses; retain Debian's ffmpeg and
+# ffprobe executables for integration tests. Distinct library SONAMEs coexist.
+echo 'Checking FFmpeg 8.1.2 libraries'
+if [[ $(pkg-config --modversion libavcodec 2>/dev/null || true) != 62.28.102 ]]; then
+    curl -fsSL --retry 3 https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz -o "$scratch/ffmpeg.tar.xz"
+    echo "464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c  $scratch/ffmpeg.tar.xz" | sha256sum --check
+    tar -xJf "$scratch/ffmpeg.tar.xz" -C "$scratch"
+    (
+        cd "$scratch/ffmpeg-8.1.2"
+        ./configure --prefix=/usr/local --enable-shared --disable-static \
+            --disable-programs --disable-doc --disable-debug --disable-autodetect \
+            --disable-everything --enable-gpl --enable-libx264 --enable-vaapi \
+            --enable-libdrm --enable-encoder=libx264,h264_vaapi \
+            --enable-muxer=mp4,matroska --enable-filter=buffer,buffersink,scale_vaapi \
+            --enable-protocol=file
+        make -j"$(nproc)"
+        sudo make install
+    )
+fi
+sudo ldconfig
+echo "FFmpeg libraries ready (${SECONDS}s)"
+
+# The orb's Python lives in /usr/local, outside Debian's python3-pil path.
+echo 'Checking Pillow 11.3.0'
+uv pip install --python /usr/local/bin/python3 Pillow==11.3.0
+
+echo 'Fetching pinned Zig dependencies'
+# Zig 0.16 rejects the orb's resolv.conf when its last line lacks a newline.
+# Preserve the resolver configuration and only terminate that line if needed.
+if [[ -s /etc/resolv.conf && -n $(tail -c 1 /etc/resolv.conf) ]]; then
+    printf '\n' | sudo tee -a /etc/resolv.conf >/dev/null
+fi
+zig build --fetch
+echo "Setup finished in $((SECONDS - started))s. Run zig build and zig build test."
