@@ -1,53 +1,92 @@
 #!/usr/bin/env bash
 set -euo pipefail
-packages=(pkg-config libpng-dev libcairo2-dev libx264-dev nasm libva-dev libgbm-dev libdrm-dev sway swaybg grim ffmpeg python3-pil libsystemd-dev python3-dbus python3-gi ninja-build libxkbcommon-dev libinput-dev libseat-dev libudev-dev libjson-c-dev libpcre2-dev libpango1.0-dev libevdev-dev libffi-dev libexpat1-dev libmtdev-dev)
+
+# Debian 12 orb prerequisites. No compositor or other service is started here.
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+started=$SECONDS
+packages=(build-essential ca-certificates curl xz-utils pkg-config nasm
+    libpng-dev libva-dev libgbm-dev libdrm-dev libx264-dev
+    ffmpeg sway swaybg grim fonts-dejavu-core
+    python3-pil libsystemd-dev python3-dbus python3-gi
+    ninja-build libcairo2-dev libxkbcommon-dev libinput-dev libseat-dev
+    libudev-dev libjson-c-dev libpcre2-dev libpango1.0-dev libevdev-dev
+    libffi-dev libexpat1-dev libmtdev-dev)
 missing=()
 for package in "${packages[@]}"; do
-    dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q 'install ok installed' || missing+=("$package")
+    if [[ $(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true) != 'install ok installed' ]]; then
+        missing+=("$package")
+    fi
 done
+echo 'Checking system dependencies'
 if ((${#missing[@]})); then
     sudo apt-get update -qq
-    sudo apt-get install -y "${missing[@]}"
+    sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}"
 fi
-python3 -m pip install 'meson>=1.3,<2' 'Pillow>=10,<13'
-bash .agents/setup-wayland
-if ! command -v zig >/dev/null || [[ $(zig version) != 0.16.0 ]]; then
-    archive=$(mktemp)
-    trap 'rm -f "$archive"' EXIT
-    curl -fsSL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz -o "$archive"
-    echo "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00  $archive" | sha256sum -c -
-    sudo tar -xJf "$archive" -C /opt
-    sudo ln -sf /opt/zig-x86_64-linux-0.16.0/zig /usr/local/bin/zig
+echo "System dependencies ready (${SECONDS}s)"
+
+scratch=$(mktemp -d)
+trap 'rm -rf "$scratch"' EXIT
+
+echo 'Checking Zig 0.16.0'
+zig_prefix=/opt/zig-0.16.0
+if [[ ! -x $zig_prefix/zig ]] || [[ $($zig_prefix/zig version) != 0.16.0 ]]; then
+    case $(uname -m) in
+        x86_64) arch=x86_64; checksum=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00 ;;
+        aarch64) arch=aarch64; checksum=ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17 ;;
+        *) echo 'Unsupported Zig architecture' >&2; exit 1 ;;
+    esac
+    curl -fsSL --retry 3 "https://ziglang.org/download/0.16.0/zig-${arch}-linux-0.16.0.tar.xz" -o "$scratch/zig.tar.xz"
+    echo "$checksum  $scratch/zig.tar.xz" | sha256sum --check
+    tar -xJf "$scratch/zig.tar.xz" -C "$scratch"
+    sudo mkdir -p "$zig_prefix"
+    sudo cp -a "$scratch/zig-${arch}-linux-0.16.0/." "$zig_prefix/"
 fi
-# Debian 12's FFmpeg 5 lacks APIs used by the existing recording bridge.
-if [[ ! -f /opt/ouroshot-ffmpeg/lib/pkgconfig/libavcodec.pc ]]; then
-    scratch=$(mktemp -d)
-    curl -fsSL https://ffmpeg.org/releases/ffmpeg-7.1.2.tar.xz -o "$scratch/ffmpeg.tar.xz"
-    echo "089bc60fb59d6aecc5d994ff530fd0dcb3ee39aa55867849a2bbc4e555f9c304  $scratch/ffmpeg.tar.xz" | sha256sum -c -
-    tar -xf "$scratch/ffmpeg.tar.xz" -C "$scratch"
-    (cd "$scratch/ffmpeg-7.1.2" && ./configure --prefix=/opt/ouroshot-ffmpeg --enable-shared --disable-static --disable-doc --disable-debug --disable-programs --disable-network --enable-gpl --enable-libx264 && make -j8 && sudo make install)
-    rm -rf "$scratch"
+sudo ln -sfn "$zig_prefix/zig" /usr/local/bin/zig
+echo "Zig ready (${SECONDS}s)"
+
+# Bookworm's FFmpeg 5 lacks AVBufferSrcParameters.color_space/color_range.
+# Build only the libraries/features ouroshot uses; retain Debian's ffmpeg and
+# ffprobe executables for integration tests. Distinct library SONAMEs coexist.
+# A private include prefix avoids Zig preferring distro headers over /usr/local.
+ffmpeg_prefix=/opt/ouroshot-ffmpeg
+export PKG_CONFIG_PATH="$ffmpeg_prefix/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+echo 'Checking FFmpeg 8.1.2 libraries'
+if [[ ! -f $ffmpeg_prefix/lib/pkgconfig/libavcodec.pc || $(pkg-config --modversion libavcodec 2>/dev/null || true) != 62.28.102 ]]; then
+    curl -fsSL --retry 3 https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz -o "$scratch/ffmpeg.tar.xz"
+    echo "464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c  $scratch/ffmpeg.tar.xz" | sha256sum --check
+    tar -xJf "$scratch/ffmpeg.tar.xz" -C "$scratch"
+    (
+        cd "$scratch/ffmpeg-8.1.2"
+        ./configure --prefix="$ffmpeg_prefix" --enable-shared --disable-static \
+            --disable-programs --disable-doc --disable-debug --disable-autodetect \
+            --disable-everything --enable-gpl --enable-libx264 --enable-vaapi \
+            --enable-libdrm --enable-encoder=libx264,h264_vaapi \
+            --enable-muxer=mp4,matroska --enable-filter=buffer,buffersink,scale_vaapi \
+            --enable-protocol=file
+        make -j"$(nproc)"
+        sudo make install
+    )
 fi
-export PKG_CONFIG_PATH="/opt/ouroshot-ffmpeg/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-if ! grep -Fq '# ouroshot FFmpeg' "$HOME/.bash_profile"; then
+if ! grep -Fqx '# ouroshot FFmpeg' "$HOME/.bash_profile" 2>/dev/null; then
     printf '\n# ouroshot FFmpeg\nexport PKG_CONFIG_PATH=/opt/ouroshot-ffmpeg/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}\n' >> "$HOME/.bash_profile"
 fi
-echo /opt/ouroshot-ffmpeg/lib | sudo tee /etc/ld.so.conf.d/ouroshot-ffmpeg.conf >/dev/null
+echo "$ffmpeg_prefix/lib" | sudo tee /etc/ld.so.conf.d/ouroshot-ffmpeg.conf >/dev/null
 sudo ldconfig
-# Zig's resolver rejects the orb's newline-less resolv.conf. curl/git honor it;
-# fetch these exact pinned contents into Zig's verified package cache instead.
-if ! zig build --fetch; then
-    scratch=$(mktemp -d)
-    curl -fsSL https://github.com/rockorager/wayring/archive/f25839e4c4700c42fbb4cb3f8951b653829cf1d2.tar.gz -o "$scratch/wayring.tar.gz"
-    zig fetch "$scratch/wayring.tar.gz"
-    curl -fsSL https://gitlab.freedesktop.org/wayland/wayland/-/releases/1.26.0/downloads/wayland-1.26.0.tar.xz -o "$scratch/wayland.tar.xz"
-    zig fetch "$scratch/wayland.tar.xz"
-    curl -fsSL https://gitlab.freedesktop.org/wayland/wayland-protocols/-/releases/1.49/downloads/wayland-protocols-1.49.tar.xz -o "$scratch/protocols.tar.xz"
-    zig fetch "$scratch/protocols.tar.xz"
-    git clone -q https://gitlab.freedesktop.org/wlroots/wlr-protocols.git "$scratch/wlr"
-    git -C "$scratch/wlr" archive --format=tar bf4fc79abc359eea5a0edec0ac6d4a2b2955f82a -o "$scratch/wlr.tar"
-    zig fetch "$scratch/wlr.tar"
-    rm -rf "$scratch"
+echo "FFmpeg libraries ready (${SECONDS}s)"
+
+# The orb's Python lives in /usr/local, outside Debian's python3-pil path.
+echo 'Checking Pillow 11.3.0'
+uv pip install --python /usr/local/bin/python3 Pillow==11.3.0
+
+echo 'Checking private headless Sway and wlroots'
+uv pip install --python /usr/local/bin/python3 'meson>=1.3,<2'
+bash .agents/setup-wayland
+
+echo 'Fetching pinned Zig dependencies'
+# Zig 0.16 rejects the orb's resolv.conf when its last line lacks a newline.
+# Preserve the resolver configuration and only terminate that line if needed.
+if [[ -s /etc/resolv.conf && -n $(tail -c 1 /etc/resolv.conf) ]]; then
+    printf '\n' | sudo tee -a /etc/resolv.conf >/dev/null
 fi
-zig build
-zig build test
+zig build --fetch
+echo "Setup finished in $((SECONDS - started))s. Run zig build and zig build test."
