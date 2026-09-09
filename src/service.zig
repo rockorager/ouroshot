@@ -71,6 +71,7 @@ const Service = struct {
     listener: c_int,
     directory: c_int,
     capture_path: []const u8,
+    environ: std.process.Environ,
     timeout_ns: i64,
 
     fn cancel(self: *Service) void {
@@ -117,9 +118,9 @@ const Service = struct {
             return connection.reply(.{ .@"error" = "org.varlink.service.MethodNotFound", .parameters = .{ .method = request_value.method[dot + 1 ..] } });
         }
         _ = std.json.parseFromValue(Parameters, fixed.allocator(), request_value.parameters, .{}) catch return connection.invalid("parameters");
-        // Capture stays unavailable until native consent/selection UI returns.
-        // Caller hints must never turn the missing UI into silent approval.
-        if (!fixture) return connection.failure(interface ++ ".Failed");
+        // Color selection is deferred. Screenshots use the existing selector;
+        // caller hints never bypass the user's explicit region selection.
+        if (!fixture and !screenshot) return connection.failure(interface ++ ".Failed");
         if (self.worker != null) return connection.failure(interface ++ ".Busy");
         self.start(index, screenshot) catch |err| {
             std.debug.print("ouroshot-service: start: {s}\n", .{@errorName(err)});
@@ -160,7 +161,7 @@ const Service = struct {
             for (&self.connections) |connection| if (connection.fd >= 0) {
                 _ = c.close(connection.fd);
             };
-            const color = capture(screenshot, image_fd) catch |err| {
+            const color = capture(self.environ, screenshot, image_fd) catch |err| {
                 std.debug.print("ouroshot-service: capture: {s}\n", .{@errorName(err)});
                 writeAll(pipe[1], if (err == error.Cancelled) "C" else "F") catch {};
                 c._exit(0);
@@ -327,7 +328,7 @@ const Service = struct {
     }
 };
 
-fn capture(screenshot: bool, image_fd: c_int) ![3]f64 {
+fn capture(environ: std.process.Environ, screenshot: bool, image_fd: c_int) ![3]f64 {
     if (fixture) {
         // Only in the separately named test binary, never in ouroshot-service.
         // stdin is a deterministic UI gate: S=accept, C=cancel, F=fail.
@@ -338,7 +339,18 @@ fn capture(screenshot: bool, image_fd: c_int) ![3]f64 {
         if (screenshot and c.shot_png_fd(image_fd, &[_]u8{ 51, 102, 204, 255, 17, 34, 68, 255 }, 2, 1) != 0) return error.PngWriteFailed;
         return .{ 0.8, 0.4, 0.2 };
     }
-    return error.CaptureUnavailable;
+    if (!screenshot) return error.CaptureUnavailable;
+    var app: client.Client = undefined;
+    try app.init(environ);
+    defer app.deinit();
+    _ = try app.capture(false, null);
+    // Reuse the CLI's frozen selector: finishing a drag approves only that
+    // region. No separate card, automatic full-desktop capture or new UI.
+    const region = try app.select(true);
+    var image = try app.compose(region);
+    defer image.deinit(allocator);
+    if (c.shot_png_fd(image_fd, image.data.ptr, @intCast(image.width), @intCast(image.height)) != 0) return error.PngWriteFailed;
+    return .{ 0, 0, 0 };
 }
 
 fn errno() c_int {
@@ -389,7 +401,7 @@ fn run(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--help")) return writeAll(1, "ouroshot-service [--idle-ms N] [--timeout-ms N]\nSocket: $XDG_RUNTIME_DIR/ouro/capture.sock, or systemd LISTEN_FDS=1.\nScreenshot and PickColor are unavailable until native UI is implemented.\n");
+        if (std.mem.eql(u8, args[i], "--help")) return writeAll(1, "ouroshot-service [--idle-ms N] [--timeout-ms N]\nSocket: $XDG_RUNTIME_DIR/ouro/capture.sock, or systemd LISTEN_FDS=1.\nScreenshot uses the existing region selector. PickColor is not yet available.\n");
         if (i + 1 >= args.len) return error.UnknownOption;
         if (std.mem.eql(u8, args[i], "--idle-ms")) idle_ms = try std.fmt.parseInt(i64, args[i + 1], 10) else if (std.mem.eql(u8, args[i], "--timeout-ms")) timeout_ms = try std.fmt.parseInt(i64, args[i + 1], 10) else return error.UnknownOption;
         i += 1;
@@ -443,7 +455,7 @@ fn run(init: std.process.Init) !void {
     defer allocator.free(capture_path);
     const service = try allocator.create(Service);
     defer allocator.destroy(service);
-    service.* = .{ .listener = listener, .directory = directory, .capture_path = capture_path, .timeout_ns = timeout_ms * 1_000_000 };
+    service.* = .{ .listener = listener, .directory = directory, .capture_path = capture_path, .environ = init.minimal.environ, .timeout_ns = timeout_ms * 1_000_000 };
     defer for (0..service.connections.len) |index| service.close(index);
     try service.loop(idle_ms * 1_000_000);
 }

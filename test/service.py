@@ -359,7 +359,10 @@ class TransportTests(unittest.TestCase):
             self.assertEqual(s.recv(1), b"")
             def dead():
                 path = Path(f"/proc/{pid}/stat")
-                return not path.exists() or path.read_text().split()[2] == "Z"
+                try:
+                    return path.read_text().split()[2] == "Z"
+                except FileNotFoundError:
+                    return True
             until(dead)
             self.assertEqual(list(self.service.captures.iterdir()), [])
 

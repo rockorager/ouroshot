@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Production service must not capture or open UI while native UI is deferred.
+"""Production PickColor must not capture or open UI while its picker is deferred.
 
 Optional --bridge PATH checks real ourobridge failure mapping on a private bus:
 dbus-run-session -- env OUROSHOT_PRIVATE_TEST_BUS=1 /usr/bin/python3 \
@@ -34,7 +34,7 @@ with tempfile.TemporaryDirectory(prefix="ouroshot-unavailable-") as directory:
             # Even bytes that approve the separately built fixture cannot enable
             # capture in the production executable.
             service.gate(b"SSSS")
-            for method in ("Screenshot", "PickColor"):
+            for method in ("PickColor",):
                 for interactive in (False, True):
                     params = copy.deepcopy(PARAMS)
                     params["interactive"] = interactive
@@ -44,7 +44,7 @@ with tempfile.TemporaryDirectory(prefix="ouroshot-unavailable-") as directory:
             assert not service.workers()
             assert not list(service.captures.iterdir())
             assert not select.select([wayland], [], [], .1)[0], "service contacted Wayland"
-            print("PASS production Screenshot/PickColor fail closed for all hints; no worker, Wayland connection or artifact", flush=True)
+            print("PASS production PickColor fails closed for all hints; no worker, Wayland connection or artifact", flush=True)
 
             if args.bridge:
                 assert os.environ.get("OUROSHOT_PRIVATE_TEST_BUS") == "1", "use dbus-run-session with explicit private-test marker"
@@ -57,13 +57,13 @@ with tempfile.TemporaryDirectory(prefix="ouroshot-unavailable-") as directory:
                     bridge = subprocess.Popen([str(Path(args.bridge).resolve())], env=env, stderr=log)
                     try:
                         until(lambda: bus.name_has_owner(name))
-                        for method in ("Screenshot", "PickColor"):
+                        for method in ("PickColor",):
                             result = bus.call_blocking(name, path, "org.freedesktop.impl.portal.Screenshot", method, "ossa{sv}",
                                                       (dbus.ObjectPath(path + "/request/test/" + method), "org.example.Test", "", dbus.Dictionary({}, signature="sv")), timeout=3)
                             assert result[0] == 2 and not result[1], result
                         assert not service.workers() and not list(service.captures.iterdir())
                         assert not select.select([wayland], [], [], .1)[0]
-                        print("PASS real ourobridge -> real ouroshot: both unavailable methods map to portal response 2", flush=True)
+                        print("PASS real ourobridge -> real ouroshot: deferred PickColor maps to portal response 2", flush=True)
                     finally:
                         bridge.terminate()
                         bridge.wait(timeout=3)

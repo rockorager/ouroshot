@@ -182,19 +182,20 @@ normal screenshot, geometry and recording commands do not acquire service
 consent prompts. No D-Bus code runs in ouroshot. The separately developed
 ourobridge Screenshot adapter translates portal requests to this native API.
 
-**Native service UI is deferred.** Both `Screenshot` and `PickColor` currently
-return `dev.rockorager.ouro.Capture.Failed` for valid requests (portal response 2
-through ourobridge). They do not connect to Wayland, start a capture worker, or
-create images. Removing the UI does not grant silent approval. The existing
-direct CLI selector, screenshots and recording still work normally.
+**Screenshot works through the existing frozen-region selector.** Complete a
+drag to share that region, or Escape/right click to cancel. There is no separate
+confirmation card. Region selection is required even when `interactive=false`:
+caller hints never grant automatic full-desktop capture. Direct CLI behavior is
+unchanged. Only `PickColor` is deferred and returns
+`dev.rockorager.ouro.Capture.Failed` (portal response 2 through ourobridge).
 
 The wire contract is [dev.rockorager.ouro.Capture](protocol/dev.rockorager.ouro.Capture.varlink),
 copied from the renamed ourobridge contract. Method validation and
 `org.varlink.service` discovery remain available. One connection carries one
 NUL-terminated JSON request and one final reply. Frames are limited to 64 KiB
 including NUL; pipelining, streaming, upgrade and one-way calls are unsupported.
-There are at most 64 live connections. Worker cancellation, Busy policy and
-artifact publication infrastructure remain covered by the isolated test fixture.
+There are at most 64 live connections and one capture worker. Overlapping
+screenshots return `Busy`; the listener remains responsive during selection.
 
 ### Launch and socket activation
 
@@ -221,9 +222,8 @@ The daemon exits normally after **30 seconds with no connections or worker**;
 systemd's listener remains available for reactivation. A request has a five-minute
 monotonic deadline, including input and response I/O. `--idle-ms` and
 `--timeout-ms` permit shorter isolated tests (both limited to 1–300000 ms).
-The retained worker infrastructure cancels work on EOF before final result
-commit or on service shutdown. A parent-death signal prevents orphan workers
-after a crash; these paths are currently exercised only by the test fixture.
+EOF before final result commit or service shutdown cancels the worker and
+dismisses selection. A parent-death signal prevents orphan workers after a crash.
 
 Initial deployment assumes **one active desktop per Unix user/runtime**. It
 does not choose among simultaneous desktop sessions. No unit or portal setting
@@ -232,7 +232,7 @@ must be configured and verified separately through ourobridge.
 
 ### Consent, colors, and artifacts
 
-Future successful service operations must require native user input, regardless of
+Successful service operations require native user input, regardless of
 `require_confirmation`, `permission_store_checked`, `origin`, or `app_id`.
 `SO_PEERCRED` must identify the service's effective UID. Claimed application
 identity is attribution, not authorization.
@@ -241,20 +241,23 @@ modify the same user's runtime, inject compositor input, or trace its processes.
 
 The service's Cairo consent card, region instructions and color picker have
 been removed pending a future UI design. Ouroshot does not link Cairo or Pango.
-`modal`, `interactive` and `parent_window` remain hints, not authority.
+Screenshots reuse the CLI selector without changing its appearance. The frozen
+preview is captured locally before selection; nothing is published or returned
+until the user selects a nonempty region. `modal`, `interactive` and
+`parent_window` remain hints, not authority. There is currently no app-attribution
+display or parent-window attachment.
 
 The color contract still requires exactly three finite sRGB-encoded components
 in [0,1]. Wlr-screencopy and 8-bit SDR alone do not establish sRGB. A future
 picker must supply reliable source metadata/conversion or an explicit native
 desktop guarantee. The former `--capture-source-srgb` option is removed along
-with the picker; no request parameter can enable capture.
+with the picker; no request parameter can enable color picking.
 
 The retained artifact writer does not falsely attach an sRGB/gamma profile.
 An unnamed 0600 PNG is written and closed by the worker; only then is it atomically
 linked under a random name in the user-owned 0700 `ouro/captures` directory.
 No destination is overwritten and no caller supplies an output path. Successful
-fixture replies contain correctly percent-encoded absolute `file:///` URIs;
-the production service currently returns no images.
+Screenshot replies contain correctly percent-encoded absolute `file:///` URIs.
 
 Once committed, a successful file survives disconnects, idle exit, and service
 or bridge restarts. Ambiguous send/disconnect races retain the file rather than
@@ -271,7 +274,7 @@ varlinkctl info "$XDG_RUNTIME_DIR/ouro/capture.sock"
 varlinkctl introspect "$XDG_RUNTIME_DIR/ouro/capture.sock" dev.rockorager.ouro.Capture
 varlinkctl call "$XDG_RUNTIME_DIR/ouro/capture.sock" dev.rockorager.ouro.Capture.Screenshot \
   '{"context":{"app_id":"org.example.Native","parent_window":"","origin":"native","require_confirmation":true,"permission_store_checked":false},"modal":true,"interactive":true}'
-# Screenshot and PickColor currently return dev.rockorager.ouro.Capture.Failed.
+# PickColor is deferred and returns dev.rockorager.ouro.Capture.Failed.
 ```
 
 ### Service verification
@@ -281,10 +284,14 @@ zig build test
 zig build -Dservice-test-fixture=true
 python3 test/service.py
 python3 test/service_unavailable.py
+python3 test/service_wayland.py
 # Real bridge/native integration; the test owns the frontend name, not a real
 # xdg-desktop-portal instance. Requires Python dbus in that interpreter.
 dbus-run-session -- env OUROSHOT_PRIVATE_TEST_BUS=1 /usr/bin/python3 \
   test/service_unavailable.py --bridge /path/to/ourobridge
+# Real Screenshot selection/cancellation; also requires PyGObject.
+dbus-run-session -- env OUROSHOT_PRIVATE_TEST_BUS=1 /usr/bin/python3 \
+  test/service_wayland.py --bridge /path/to/ourobridge
 ```
 
 The additional **ouroshot-service-fixture** executable replaces only the capture
@@ -294,10 +301,11 @@ tests use real Unix sockets, real worker processes, and inherited listening fds;
 they cover framing/type errors, Busy, cancellation of pending work, late results,
 PNG modes/URI encoding, and idle exit/reactivation with retained results.
 
-The production test verifies both methods fail regardless of caller hints,
-without a worker, image, or even an attempted Wayland connection. Optional real
-ourobridge integration checks that these failures become portal response 2.
-This is not successful capture or document-export verification.
+The unavailable-method test verifies PickColor fails regardless of caller hints,
+without a worker, image, or attempted Wayland connection. The Wayland test checks
+real Screenshot selection and exact pixels at 150%, Busy, cancellation and EOF.
+Optional real ourobridge integration checks Screenshot success, native cancel,
+Request.Close, and deferred PickColor failure. It does not test document export.
 
 The CLI integration suite still renders its selector on private headless Sway.
 Test cursors are transparent to isolate image pixels; cursor inclusion is not

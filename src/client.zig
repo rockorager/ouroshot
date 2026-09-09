@@ -547,6 +547,10 @@ pub const Client = struct {
         try self.draw();
         while (!self.selected and !self.cancelled) try self.pump(self, now() + 300_000_000_000);
         self.selecting = false;
+        // Both callers close the connection on cancellation. A held right
+        // button can retain an implicit grab; do not destroy its surface IDs
+        // while the compositor can still send leave events for them.
+        if (self.cancelled) return error.Cancelled;
         // Drain pointer/keyboard leave events while their surface IDs still
         // exist. Destroying IDs before unmapping races those object references.
         for (self.outputs[0..self.output_count]) |output| {

@@ -30,8 +30,8 @@ using `.agents/setup-wayland`. The `sway` and `swaymsg` wrappers use its private
 libraries without changing other programs' library search paths. Cairo,
 Pango and Pixman are test-compositor dependencies, not ouroshot UI dependencies.
 The CLI suite uses private transparent cursors and deterministic backgrounds;
-it does not verify cursor inclusion. Native service UI is deferred and its
-production tests verify capture requests fail closed.
+it does not verify cursor inclusion. Service Screenshot uses the same region
+selector; PickColor stays deferred and its production tests verify failure.
 
 The orb has no DRM render device, so DMA-BUF/VAAPI runtime tests need a
 GPU-equipped machine. The setup does not start or modify the active desktop.
