@@ -1,0 +1,25 @@
+.{
+    .name = .ouroshot,
+    .version = "0.0.0",
+    .fingerprint = 0x5728903854b33df,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .wayring = .{
+            .url = "https://github.com/rockorager/wayring/archive/f25839e4c4700c42fbb4cb3f8951b653829cf1d2.tar.gz",
+            .hash = "wayring-0.1.0-N0pphwnDFADaEKHi44qMH9mRUXz_3qSbG4L73RXIXkuW",
+        },
+        .wayland = .{
+            .url = "https://gitlab.freedesktop.org/wayland/wayland/-/releases/1.26.0/downloads/wayland-1.26.0.tar.xz",
+            .hash = "N-V-__8AAA46JQABKU7sa-6xGUAN44uFsYSUS_w79UVuu7qo",
+        },
+        .wayland_protocols = .{
+            .url = "https://gitlab.freedesktop.org/wayland/wayland-protocols/-/releases/1.49/downloads/wayland-protocols-1.49.tar.xz",
+            .hash = "N-V-__8AAOTNEADZkChhsSciYizE4kIbZsozjDZXVeG5R_uY",
+        },
+        .wlr_protocols = .{
+            .url = "git+https://gitlab.freedesktop.org/wlroots/wlr-protocols.git#bf4fc79abc359eea5a0edec0ac6d4a2b2955f82a",
+            .hash = "N-V-__8AAMq4AQASESNUzI38keQUB1Pz9OXa_YoUwXAgWQQl",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "test", "README.md", "LICENSE" },
+}
