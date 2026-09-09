@@ -2,3 +2,5 @@
 zig-out/
 zig-pkg/
 /ouroshot.png
+.amp/
+__pycache__/

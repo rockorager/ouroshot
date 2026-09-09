@@ -10,10 +10,10 @@ on compatible outputs: DMA-BUF capture → VAAPI crop/color conversion → H.264
 
 ## Build and run
 
-Requires Linux, Zig 0.16.0, pkg-config, libpng, and FFmpeg development libraries
+Requires Linux, Zig 0.16.0, pkg-config, libpng, Cairo, and FFmpeg development libraries
 (`libavcodec`, `libavformat`, `libavutil`, `libavfilter`, `libswscale`) with libx264
 and VAAPI support, plus libva, GBM, and libdrm. On Arch: `libpng`, `ffmpeg`,
-`libva`, `mesa`, and `libdrm`. Hardware encoding also needs the GPU's VAAPI driver
+`cairo`, `libva`, `mesa`, and `libdrm`. Hardware encoding also needs the GPU's VAAPI driver
 (for recent Intel GPUs, `intel-media-driver`). Without it, auto mode uses libx264.
 
 ```sh
@@ -135,7 +135,7 @@ Current limitations:
   Multi-output/rotated recording and screenshots retain the older protocol.
 - Ext capture buffers cover the output even for small crops; the compositor
   may optimize their updates using damage. The encoder only converts the crop.
-- No audio or portal integration. No promise of 4K/120 Hz recording.
+- No audio or PipeWire ScreenCast portal. No promise of 4K/120 Hz recording.
 - 8-bit SDR capture only; no HDR conversion or ICC profile embedding. Captured
   bytes are used as supplied by the compositor; video conversion assumes sRGB
   primaries/transfer and BT.709 YUV coefficients.
@@ -174,3 +174,134 @@ headless Sway and the same looping 60 fps clip. It includes capture and encoding
 but excludes compositor/player CPU and does not equate encoder quality settings.
 `benchmark/encode.py` is an encoder-only control excluding capture and input
 generation. Both retain videos and machine-readable results.
+
+## Native Varlink capture service
+
+`zig build` also produces **ouroshot-service**. This is independent of the CLI:
+normal screenshot, geometry and recording commands do not acquire service
+consent prompts. No D-Bus code runs in ouroshot. The separately developed
+ourobridge Screenshot adapter translates portal requests to this native API.
+
+The wire contract is [dev.rockorager.ouro.Capture](protocol/dev.rockorager.ouro.Capture.varlink),
+copied from the renamed ourobridge contract. It implements `Screenshot` and
+`PickColor`, plus `org.varlink.service` discovery. One connection carries one
+NUL-terminated JSON request and one final reply. Frames are limited to 64 KiB
+including NUL; pipelining, streaming, upgrade and one-way calls are unsupported.
+There are at most 64 live connections and one interactive worker. Overlapping
+captures return `Busy`; the listener remains responsive during interaction.
+
+### Launch and socket activation
+
+From a Wayland session, run `zig-out/bin/ouroshot-service` directly for native
+clients. It binds `$XDG_RUNTIME_DIR/ouro/capture.sock` without replacing an
+existing endpoint. `XDG_RUNTIME_DIR` must be an absolute, user-owned 0700
+directory with no symlink components. Service storage uses Linux `openat2`,
+`O_TMPFILE`, and `/proc/self/fd`; unsupported runtime filesystems fail closed.
+
+The files in [systemd/](systemd/) are **inert packaging examples**. Nothing in
+the build installs/enables user units or changes portal routing. A packager can
+place them in the systemd user unit directory and adjust `ExecStart` for the
+installed executable. The desktop must supply `WAYLAND_DISPLAY` and
+`XDG_RUNTIME_DIR` to its user service manager (for example, import the session's
+Wayland environment before starting `graphical-session.target`).
+
+`ouroshot-capture.socket` uses `%t/ouro/capture.sock`, `Accept=no`, socket mode
+0600 and directory mode 0700. systemd owns the listener and starts one
+`Type=exec` service when a client connects. The service validates `LISTEN_PID`,
+exactly one listening AF_UNIX/SOCK_STREAM fd, its address, ownership and mode.
+It is not `Type=oneshot` and does not spawn overlapping selectors per connection.
+
+The daemon exits normally after **30 seconds with no connections or worker**;
+systemd's listener remains available for reactivation. A request has a five-minute
+monotonic deadline, including input and response I/O. `--idle-ms` and
+`--timeout-ms` permit shorter isolated tests (both limited to 1–300000 ms).
+EOF before final result commit terminates the worker and dismisses the UI,
+including while the user is deciding or selecting. Service shutdown does the
+same. A parent-death signal prevents orphan capture workers after a crash.
+
+Initial deployment assumes **one active desktop per Unix user/runtime**. It
+does not choose among simultaneous desktop sessions. No unit or portal setting
+has been enabled automatically; desktop routing and frontend document export
+must be configured and verified separately through ourobridge.
+
+### Consent, colors, and artifacts
+
+Every successful service operation requires native user input, regardless of
+`require_confirmation`, `permission_store_checked`, `origin`, or `app_id`.
+`SO_PEERCRED` must identify the service's effective UID. Claimed application
+identity is visibly marked unverified; it is attribution, not authorization.
+This is not an isolation boundary against malicious processes already able to
+modify the same user's runtime, inject compositor input, or trace its processes.
+
+The initial live consent card offers Allow/Cancel before acquiring any pixels.
+A noninteractive Screenshot shares all outputs after consent. With
+`interactive=true`, consent is followed by the existing frozen region selector.
+PickColor asks for consent then a pixel on the frozen desktop. Enter accepts
+the consent card; Escape/right click cancels any native interaction. `modal`
+and `parent_window` are hints only: this initial implementation uses global
+layer-shell overlays and does not attach them to a caller-supplied parent.
+
+**PickColor fails by default**, because wlr-screencopy does not establish the
+capture buffer's color space. Only use the native startup option
+`--capture-source-srgb` when the desktop configuration guarantees that every
+output supplies sRGB-encoded capture bytes. It is not a conversion option and
+must not be enabled merely because an output is 8-bit SDR. Under that guarantee,
+the selected native BGRA pixel becomes exactly three sRGB-encoded RGB components
+in [0,1]; fractional coordinates use the selected output's actual pixel size.
+Unknown display RGB, ICC-managed or HDR sources need future metadata/conversion
+support. No request parameter can enable the guarantee. This fail-closed behavior
+was agreed with ourobridge and requires no wire change.
+
+Service screenshots preserve the existing raw 8-bit compositor pixels/crop rules.
+They do not perform HDR/ICC conversion or falsely attach an sRGB/gamma profile.
+An unnamed 0600 PNG is written and closed by the worker; only then is it atomically
+linked under a random name in the user-owned 0700 `ouro/captures` directory.
+No destination is overwritten and no caller supplies an output path. Replies
+contain correctly percent-encoded absolute `file:///` URIs.
+
+Once committed, a successful file survives disconnects, idle exit, and service
+or bridge restarts. Ambiguous send/disconnect races retain the file rather than
+deleting an image a frontend may already be exporting. There is no export ack,
+idle cleanup or eviction: runtime/session teardown owns cleanup. Uncommitted
+files disappear on cancellation/crash without scanning or deleting other files.
+There is currently no storage quota; runtime filesystem limits can reject new
+captures, but existing results are never evicted.
+
+Native example (requires `varlinkctl`):
+
+```sh
+varlinkctl info "$XDG_RUNTIME_DIR/ouro/capture.sock"
+varlinkctl introspect "$XDG_RUNTIME_DIR/ouro/capture.sock" dev.rockorager.ouro.Capture
+varlinkctl call "$XDG_RUNTIME_DIR/ouro/capture.sock" dev.rockorager.ouro.Capture.Screenshot \
+  '{"context":{"app_id":"org.example.Native","parent_window":"","origin":"native","require_confirmation":true,"permission_store_checked":false},"modal":true,"interactive":true}'
+# Use PickColor with the same parameters for a color request.
+```
+
+### Service verification
+
+```sh
+zig build test
+zig build -Dservice-test-fixture=true
+python3 test/service.py
+python3 test/service_wayland.py
+# Real bridge/native integration; the test owns the frontend name, not a real
+# xdg-desktop-portal instance. Requires Python dbus/PyGObject in that interpreter.
+dbus-run-session -- env OUROSHOT_PRIVATE_TEST_BUS=1 /usr/bin/python3 \
+  test/service_wayland.py --bridge /path/to/ourobridge
+```
+
+The additional **ouroshot-service-fixture** executable replaces only the capture
+worker with a deterministic stdin consent gate. Never install it as the service.
+The production binary has no fixture or confirmation-bypass option. Transport
+tests use real Unix sockets, real worker processes, and inherited listening fds;
+they cover framing/type errors, Busy, cancellation of pending work, late results,
+PNG modes/URI encoding, and idle exit/reactivation with retained results.
+
+The Wayland test uses the production service on its own headless Sway/pixman
+compositor. It checks actual consent, capture pixels, selection/color sampling,
+and EOF while UI is pending, and retains review screenshots. It never injects
+input into the active desktop. Test cursors are transparent to isolate screenshot
+pixels from old compositors' software-cursor behavior; these tests do not verify
+cursor inclusion. The orb setup provisions a headless-only Sway with ext capture
+for recording tests; GPU/DRM/VAAPI, real portal document export and applications
+such as Gradia still need hardware/user-session verification.

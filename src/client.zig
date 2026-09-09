@@ -3,6 +3,7 @@ const wr = @import("wayring");
 const p = @import("protocol");
 const geo = @import("geometry.zig");
 const Image = @import("image.zig").Image;
+const consent = @import("consent.zig");
 pub const c = @cImport({
     // Import declarations rather than glibc's inline fortify wrappers, which
     // translate-c cannot compile. encode.c retains its normal C build flags.
@@ -146,6 +147,11 @@ pub const Client = struct {
     anchor: ?geo.Point = null,
     selection: ?geo.Rect = null,
     failure: ?anyerror = null,
+    service_ui: consent.Mode = .none,
+    caption: [:0]const u8 = "",
+    customize: bool = false,
+    precise_x: f64 = 0,
+    precise_y: f64 = 0,
 
     pub fn init(self: *Client, environ: std.process.Environ) !void {
         self.* = .{};
@@ -547,6 +553,10 @@ pub const Client = struct {
         try self.draw();
         while (!self.selected and !self.cancelled) try self.pump(self, now() + 300_000_000_000);
         self.selecting = false;
+        // The service worker closes this connection on cancellation. A right
+        // button can still hold an implicit grab: destroying surface IDs before
+        // its later release would invalidate the compositor's leave event.
+        if (self.cancelled and self.service_ui != .none) return error.Cancelled;
         // Drain pointer/keyboard leave events while their surface IDs still
         // exist. Destroying IDs before unmapping races those object references.
         for (self.outputs[0..self.output_count]) |output| {
@@ -580,7 +590,7 @@ pub const Client = struct {
             const height = try geo.pixels(output.rect.height, scale120);
             if (buffer.width != width or buffer.height != height) try self.allocateBuffer(buffer, width, height, width * 4, 0);
             var redraw = output.rect;
-            if (buffer.initialized) {
+            if (buffer.initialized and self.service_ui == .none) {
                 if (self.selection) |selection| {
                     redraw = selection.expanded(3);
                     if (buffer.previous) |previous| redraw = redraw.unite(previous.expanded(3));
@@ -595,7 +605,7 @@ pub const Client = struct {
                 const y1: u32 = @min(height, @as(u32, @intCast(@divFloor((dirty.bottom() - output.rect.y) * scale120 + 119, 120))));
                 for (y0..y1) |y| for (x0..x1) |x| {
                     const point = geo.Point{ .x = output.rect.x + @as(i32, @intCast(x * 120 / scale120)), .y = output.rect.y + @as(i32, @intCast(y * 120 / scale120)) };
-                    const inside = if (self.selection) |r| r.contains(point) else false;
+                    const inside = self.service_ui == .pick or (if (self.selection) |r| r.contains(point) else false);
                     const border = if (self.selection) |r| inside and (point.x < r.x + 2 or point.y < r.y + 2 or point.x >= r.right() - 2 or point.y >= r.bottom() - 2) else false;
                     const dst = buffer.bytes[y * buffer.stride + x * 4 ..][0..4];
                     if (self.freeze and output.snapshot != null) {
@@ -606,8 +616,9 @@ pub const Client = struct {
                     } else dst.* = if (border) .{ 255, 255, 255, 255 } else if (inside) .{ 0, 0, 0, 0 } else .{ 0, 0, 0, 102 };
                 };
             }
+            if (self.service_ui != .none) try consent.draw(buffer.bytes, width, height, buffer.stride, scale120, output.rect, self.service_ui, self.caption, self.customize);
             var damage = output.rect;
-            if (buffer.initialized and self.selection != null and output.displayed != null) damage = self.selection.?.expanded(3).unite(output.displayed.?.expanded(3));
+            if (self.service_ui == .none and buffer.initialized and self.selection != null and output.displayed != null) damage = self.selection.?.expanded(3).unite(output.displayed.?.expanded(3));
             const clipped = damage.intersection(output.rect) orelse output.rect;
             const surface = output.surface.?;
             if (output.viewport) |viewport| try self.send(p.wp_viewport, viewport, .{ .set_destination = .{ .width = @intCast(output.rect.width), .height = @intCast(output.rect.height) } }) else try self.send(p.wl_surface, surface, .{ .set_buffer_scale = .{ .scale = @intCast(output.scale) } });
@@ -736,6 +747,10 @@ pub const Client = struct {
                 },
                 .key => |e| {
                     if (e.key == 1 and e.state.value == 1) self.cancelled = true;
+                    if (self.selecting and (self.service_ui == .screenshot or self.service_ui == .color) and e.key == 28 and e.state.value == 1) {
+                        self.selection = self.bounds();
+                        self.selected = true;
+                    }
                 },
                 else => {},
             }
@@ -757,6 +772,29 @@ pub const Client = struct {
                     if (!self.selecting) return;
                     if (e.button == 273 and e.state.value == 1) self.cancelled = true;
                     if (e.button == 272) {
+                        if (self.service_ui == .screenshot or self.service_ui == .color) {
+                            if (e.state.value == 1) self.anchor = self.position else if (self.anchor) |anchor| {
+                                const output = self.outputs[self.pointer_output orelse return].rect;
+                                const action = consent.action(output, self.service_ui, self.position);
+                                if (action == consent.action(output, self.service_ui, anchor)) switch (action) {
+                                    .accept => {
+                                        self.selection = self.bounds();
+                                        self.selected = true;
+                                    },
+                                    .cancel => self.cancelled = true,
+                                    .none => {},
+                                };
+                                self.anchor = null;
+                            }
+                            return;
+                        }
+                        if (self.service_ui == .pick) {
+                            if (e.state.value == 1) self.anchor = self.position else if (self.anchor != null) {
+                                self.selection = .{ .x = self.position.x, .y = self.position.y, .width = 1, .height = 1 };
+                                self.selected = true;
+                            }
+                            return;
+                        }
                         if (e.state.value == 1) self.anchor = self.position else if (self.anchor != null) {
                             const rect = geo.Rect.between(self.anchor.?, self.position);
                             if (rect.width > 0 and rect.height > 0) {
@@ -870,7 +908,10 @@ pub const Client = struct {
         const index = self.pointer_output orelse return;
         const output = &self.outputs[index];
         self.position = .{ .x = output.rect.x + @divFloor(x, 256), .y = output.rect.y + @divFloor(y, 256) };
-        if (self.anchor) |anchor| {
+        self.precise_x = @as(f64, @floatFromInt(output.rect.x)) + @as(f64, @floatFromInt(x)) / 256;
+        self.precise_y = @as(f64, @floatFromInt(output.rect.y)) + @as(f64, @floatFromInt(y)) / 256;
+        if (self.anchor != null and (self.service_ui == .none or self.service_ui == .region)) {
+            const anchor = self.anchor.?;
             self.selection = geo.Rect.between(anchor, self.position);
             for (self.outputs[0..self.output_count]) |*other| other.dirty = true;
         }

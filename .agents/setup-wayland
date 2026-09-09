@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Private headless-only Sway 1.11 for ext-image-copy capture integration tests.
+set -euo pipefail
+prefix=/opt/ouroshot-wayland
+if [[ ! -x $prefix/bin/sway ]]; then
+    scratch=$(mktemp -d)
+    trap 'rm -rf "$scratch"' EXIT
+    export PKG_CONFIG_PATH="$prefix/lib/x86_64-linux-gnu/pkgconfig:$prefix/share/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+    export PATH="$prefix/bin:$PATH"
+    build_tar() {
+        local name=$1 url=$2 hash=$3
+        shift 3
+        curl -fsSL "$url" -o "$scratch/archive"
+        echo "$hash  $scratch/archive" | sha256sum -c -
+        mkdir "$scratch/$name"
+        tar -xf "$scratch/archive" --strip-components=1 -C "$scratch/$name"
+        meson setup "$scratch/$name/build" "$scratch/$name" --prefix="$prefix" "$@"
+        ninja -j8 -C "$scratch/$name/build"
+        sudo ninja -C "$scratch/$name/build" install
+    }
+    build_git() {
+        local name=$1 url=$2 tag=$3 commit=$4
+        shift 4
+        git clone -q --depth 1 --branch "$tag" "$url" "$scratch/$name"
+        [[ $(git -C "$scratch/$name" rev-parse HEAD) == "$commit" ]]
+        meson setup "$scratch/$name/build" "$scratch/$name" --prefix="$prefix" "$@"
+        ninja -j8 -C "$scratch/$name/build"
+        sudo ninja -C "$scratch/$name/build" install
+    }
+    build_tar wayland https://gitlab.freedesktop.org/wayland/wayland/-/releases/1.26.0/downloads/wayland-1.26.0.tar.xz 64176eaa46e4969903e286f8e5ef8331affc17fdf03ac9b58381d2b23162b7a3 -Dtests=false -Ddocumentation=false -Ddtd_validation=false
+    build_tar protocols https://gitlab.freedesktop.org/wayland/wayland-protocols/-/releases/1.49/downloads/wayland-protocols-1.49.tar.xz ec4c8f74942d6dff7ace8b4ce4764f0ef9ff618a935d974ea77edee2ad240b14 -Dtests=false
+    build_tar pixman https://cairographics.org/releases/pixman-0.46.4.tar.gz d09c44ebc3bd5bee7021c79f922fe8fb2fb57f7320f55e97ff9914d2346a591c -Dtests=disabled -Ddemos=disabled
+    build_tar drm https://dri.freedesktop.org/libdrm/libdrm-2.4.125.tar.xz d4bae92797a50f81a93524762e0410a49cd84cfa0f997795bc0172ac8fb1d96a -Dauto_features=disabled -Dtests=false
+    build_git libinput https://gitlab.freedesktop.org/libinput/libinput.git 1.28.1 4f7b4ef0e4eb5d569df36be387579858eba349bb -Dlibwacom=false -Ddebug-gui=false -Dtests=false -Ddocumentation=false
+    build_git wlroots https://gitlab.freedesktop.org/wlroots/wlroots.git 0.19.3 88a869855742281c98c22cab9641b317b8d065ef -Dbackends=[] -Drenderers=[] -Dallocators=[] -Dsession=disabled -Dcolor-management=disabled -Dxwayland=disabled -Dexamples=false
+    build_git sway https://github.com/swaywm/sway 1.11 990b23c0e584114c3694447344d6bbf44b2d748f -Dtray=disabled -Dswaybar=false -Dswaynag=false -Dman-pages=disabled
+fi
+# Keep this library search path out of the desktop/other tools' environments.
+for command in sway swaymsg; do
+    wrapper=$(mktemp)
+    printf '#!/bin/sh\nexport LD_LIBRARY_PATH=%s/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\nexec %s/bin/%s "$@"\n' "$prefix" "$prefix" "$command" > "$wrapper"
+    sudo install -m755 "$wrapper" "/usr/local/bin/$command"
+    rm "$wrapper"
+done

@@ -10,14 +10,13 @@ from pathlib import Path
 import re
 import shutil
 import signal
-import socket
-import struct
 import subprocess
 import sys
 import tempfile
 import time
 
 from PIL import Image, ImageChops, ImageDraw
+from pointer import Pointer, cursor_environment
 
 ROOT = Path(__file__).resolve().parents[1]
 EXE = Path(sys.argv[1] if len(sys.argv) > 1 else ROOT / "zig-out/bin/ouroshot").resolve()
@@ -25,9 +24,10 @@ ART = Path(sys.argv[2]) if len(sys.argv) > 2 else Path(tempfile.mkdtemp(prefix="
 ART.mkdir(parents=True, exist_ok=True)
 RUNTIME = Path(tempfile.mkdtemp(prefix="ouroshot-test-"))
 env = dict(os.environ, XDG_RUNTIME_DIR=str(RUNTIME), WLR_BACKENDS="headless", WLR_RENDERER=os.environ.get("OUROSHOT_TEST_RENDERER", "pixman"), WLR_HEADLESS_OUTPUTS="1")
+env.update(cursor_environment(RUNTIME))
 for key in ("WAYLAND_DISPLAY", "SWAYSOCK", "WAYLAND_DEBUG"):
     env.pop(key, None)
-(ART / "sway.conf").write_text("output HEADLESS-1 mode 960x600 scale 1.5 position 0 0\noutput * bg #204060 solid_color\nseat seat0 fallback true\nxwayland disable\n")
+(ART / "sway.conf").write_text("output HEADLESS-1 mode 960x600 scale 1.5 position 0 0\noutput * bg #204060 solid_color\nseat seat0 fallback true\nseat seat0 xcursor_theme ouroshot-test 16\nxwayland disable\n")
 
 
 def run(args, **kwargs):
@@ -49,52 +49,6 @@ def equal(a, b):
     assert a.size == b.size, (a.size, b.size)
     delta = ImageChops.difference(a.convert("RGB"), b.convert("RGB"))
     assert delta.getbbox() is None, (delta.getbbox(), delta.getextrema())
-
-
-class Pointer:
-    def __init__(self):
-        self.sock = socket.socket(socket.AF_UNIX)
-        self.sock.settimeout(3)
-        self.sock.connect(str(RUNTIME / env["WAYLAND_DISPLAY"]))
-        self.buf = b""
-        self.send(1, 1, struct.pack("I", 2))
-        self.send(1, 0, struct.pack("I", 3))
-        manager = None
-        while True:
-            obj, op, data = self.read()
-            if obj == 2 and op == 0:
-                name, n = struct.unpack_from("II", data)
-                if data[8:8+n-1] == b"zwlr_virtual_pointer_manager_v1":
-                    manager = name
-            if obj == 3:
-                break
-        assert manager is not None
-        interface = b"zwlr_virtual_pointer_manager_v1\0"
-        self.send(2, 0, struct.pack("II", manager, len(interface)) + interface + bytes(-len(interface) % 4) + struct.pack("II", 1, 4))
-        self.send(4, 0, struct.pack("II", 0, 5))
-
-    def send(self, obj, op, payload=b""):
-        self.sock.sendall(struct.pack("II", obj, ((8+len(payload)) << 16) | op) + payload)
-
-    def read(self):
-        while len(self.buf) < 8:
-            self.buf += self.sock.recv(65536)
-        obj, header = struct.unpack_from("II", self.buf)
-        size = header >> 16
-        while len(self.buf) < size:
-            self.buf += self.sock.recv(65536)
-        data, self.buf = self.buf[8:size], self.buf[size:]
-        if obj == 1 and header & 65535 == 0:
-            raise RuntimeError(repr(data))
-        return obj, header & 65535, data
-
-    def move(self, x, y):
-        self.send(5, 1, struct.pack("IIIII", int(time.monotonic()*1000) & 0xffffffff, x, y, 640, 400))
-        self.send(5, 4)
-
-    def button(self, state, button=272):
-        self.send(5, 2, struct.pack("III", int(time.monotonic()*1000) & 0xffffffff, button, state))
-        self.send(5, 4)
 
 
 children = []
@@ -123,7 +77,7 @@ try:
     env["WAYLAND_DISPLAY"] = next(p.name for p in RUNTIME.glob("wayland-*") if not p.name.endswith(".lock"))
     env["SWAYSOCK"] = str(next(RUNTIME.glob("sway-ipc*.sock")))
     time.sleep(.3)
-    pointer = Pointer()
+    pointer = Pointer(RUNTIME, env["WAYLAND_DISPLAY"])
     pointer.move(10, 10)
     time.sleep(.1)
 
@@ -183,6 +137,13 @@ try:
     assert proc.wait(timeout=5) == 0
     equal(baseline.crop((120, 90, 450, 300)), Image.open(ART / "selected.png"))
     print("PASS frozen pixels, fractional selection, shrinking redraw, clean saved crop", flush=True)
+
+    # Older Sway versions can place the second background below the first.
+    # With the pointer grab over, set an unambiguous background for live tests.
+    background.terminate()
+    background.wait(timeout=3)
+    sway("output HEADLESS-1 bg #802010 solid_color")
+    time.sleep(.25)
 
     proc = launch("geometry", ["--geometry-only"])
     time.sleep(.2)

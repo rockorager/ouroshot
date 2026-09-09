@@ -1,0 +1,13 @@
+[Unit]
+Description=Ouro native capture socket
+PartOf=graphical-session.target
+
+[Socket]
+ListenStream=%t/ouro/capture.sock
+SocketMode=0600
+DirectoryMode=0700
+Accept=no
+RemoveOnStop=yes
+
+[Install]
+WantedBy=graphical-session.target

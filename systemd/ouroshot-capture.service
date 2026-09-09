@@ -1,0 +1,14 @@
+[Unit]
+Description=Ouro native capture service
+After=graphical-session.target
+PartOf=graphical-session.target
+Requires=ouroshot-capture.socket
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/ouroshot-service
+UMask=0077
+KillMode=control-group
+TimeoutStopSec=5
+NoNewPrivileges=yes
+LimitCORE=0

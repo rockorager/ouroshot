@@ -35,6 +35,30 @@ void shot_signals(void) {
 }
 int shot_stopping(void) { return stopping; }
 
+// Takes ownership of fd, including on error. The service creates it relative
+// to a verified private directory; it never reopens a caller-supplied path.
+// Do not attach sRGB/gamma metadata to compositor bytes of unknown color space.
+int shot_png_fd(int fd, const uint8_t *bgra, int width, int height) {
+    FILE *file = fdopen(fd, "wb");
+    if (!file) { close(fd); return -1; }
+    png_structp png = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    png_infop info = png ? png_create_info_struct(png) : NULL;
+    int ok = 0;
+    if (png && info && !setjmp(png_jmpbuf(png))) {
+        png_init_io(png, file);
+        png_set_IHDR(png, info, width, height, 8, PNG_COLOR_TYPE_RGBA,
+                     PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+        png_set_bgr(png);
+        png_write_info(png, info);
+        for (int y = 0; y < height; y++) png_write_row(png, bgra + (size_t)y * width * 4);
+        png_write_end(png, info);
+        ok = 1;
+    }
+    png_destroy_write_struct(&png, &info);
+    if (fclose(file)) ok = 0;
+    return ok ? 0 : -1;
+}
+
 int shot_png(const char *path, const uint8_t *bgra, int width, int height) {
     int stream = strcmp(path, "-") == 0;
     int fd = stream ? dup(STDOUT_FILENO) : open(path, O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC, 0600);

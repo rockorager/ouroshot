@@ -56,10 +56,29 @@ pub fn build(b: *std.Build) void {
     });
     app.addIncludePath(b.path("src"));
     app.addCSourceFile(.{ .file = b.path("src/encode.c"), .flags = &.{ "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-Wall", "-Wextra" } });
-    for ([_][]const u8{ "libpng", "libavcodec", "libavformat", "libavutil", "libavfilter", "libswscale", "libva", "gbm", "libdrm" }) |lib| app.linkSystemLibrary(lib, .{});
+    for ([_][]const u8{ "libpng", "libavcodec", "libavformat", "libavutil", "libavfilter", "libswscale", "libva", "gbm", "libdrm", "cairo" }) |lib| app.linkSystemLibrary(lib, .{});
     const exe = b.addExecutable(.{ .name = "ouroshot", .root_module = app });
     b.installArtifact(exe);
     const run = b.addRunArtifact(exe);
     if (b.args) |args| run.addArgs(args);
     b.step("run", "Run ouroshot").dependOn(&run.step);
+
+    const fixture = b.option(bool, "service-test-fixture", "Build an additional gated fake-capture test executable (never install as the service)") orelse false;
+    for (0..if (fixture) @as(usize, 2) else 1) |index| {
+        const service = b.createModule(.{
+            .root_source_file = b.path("src/service.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{ .{ .name = "wayring", .module = wayring }, .{ .name = "protocol", .module = protocol } },
+        });
+        const options = b.addOptions();
+        options.addOption(bool, "fixture", index == 1);
+        service.addOptions("service_options", options);
+        service.addAnonymousImport("capture_idl", .{ .root_source_file = b.path("protocol/dev.rockorager.ouro.Capture.varlink") });
+        service.addIncludePath(b.path("src"));
+        service.addCSourceFile(.{ .file = b.path("src/encode.c"), .flags = &.{ "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-Wall", "-Wextra" } });
+        for ([_][]const u8{ "libpng", "libavcodec", "libavformat", "libavutil", "libavfilter", "libswscale", "libva", "gbm", "libdrm", "cairo" }) |lib| service.linkSystemLibrary(lib, .{});
+        b.installArtifact(b.addExecutable(.{ .name = if (index == 0) "ouroshot-service" else "ouroshot-service-fixture", .root_module = service }));
+    }
 }
