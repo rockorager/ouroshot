@@ -72,10 +72,3 @@ class Pointer:
     def button(self, state, button=272):
         self.send(5, 2, struct.pack("III", int(time.monotonic()*1000) & 0xffffffff, button, state))
         self.send(5, 4)
-
-    def click(self, x, y, button=272):
-        self.move(x, y)
-        time.sleep(.05)
-        self.button(1, button)
-        time.sleep(.05)
-        self.button(0, button)

@@ -30,7 +30,6 @@ const Request = struct { method: []const u8, parameters: std.json.Value = .null,
 
 const Connection = struct {
     fd: c_int = -1,
-    pid: c.pid_t = 0,
     input: [limit]u8 = undefined,
     used: usize = 0,
     output: ?[]u8 = null,
@@ -48,7 +47,7 @@ const Connection = struct {
         self.pending = false;
     }
     fn failure(self: *Connection, name: []const u8) !void {
-        try self.reply(.{ .@"error" = name, .parameters = .{} });
+        try self.reply(.{ .@"error" = name, .parameters = struct {}{} });
     }
     fn invalid(self: *Connection, parameter: []const u8) !void {
         try self.reply(.{ .@"error" = "org.varlink.service.InvalidParameter", .parameters = .{ .parameter = parameter } });
@@ -72,8 +71,6 @@ const Service = struct {
     listener: c_int,
     directory: c_int,
     capture_path: []const u8,
-    environ: std.process.Environ,
-    srgb: bool,
     timeout_ns: i64,
 
     fn cancel(self: *Service) void {
@@ -119,18 +116,18 @@ const Service = struct {
             if (!std.mem.eql(u8, name, interface) and !std.mem.eql(u8, name, "org.varlink.service")) return connection.reply(.{ .@"error" = "org.varlink.service.InterfaceNotFound", .parameters = .{ .interface = name } });
             return connection.reply(.{ .@"error" = "org.varlink.service.MethodNotFound", .parameters = .{ .method = request_value.method[dot + 1 ..] } });
         }
-        const parameters = std.json.parseFromValue(Parameters, fixed.allocator(), request_value.parameters, .{}) catch return connection.invalid("parameters");
+        _ = std.json.parseFromValue(Parameters, fixed.allocator(), request_value.parameters, .{}) catch return connection.invalid("parameters");
+        // Capture stays unavailable until native consent/selection UI returns.
+        // Caller hints must never turn the missing UI into silent approval.
+        if (!fixture) return connection.failure(interface ++ ".Failed");
         if (self.worker != null) return connection.failure(interface ++ ".Busy");
-        // SDR alone is not evidence of sRGB. Only a native desktop configuration
-        // can assert the screencopy source encoding; caller hints never can.
-        if (!screenshot and !self.srgb) return connection.failure(interface ++ ".Failed");
-        self.start(index, screenshot, parameters.value) catch |err| {
+        self.start(index, screenshot) catch |err| {
             std.debug.print("ouroshot-service: start: {s}\n", .{@errorName(err)});
             return connection.failure(interface ++ ".Failed");
         };
     }
 
-    fn start(self: *Service, index: usize, screenshot: bool, parameters: Parameters) !void {
+    fn start(self: *Service, index: usize, screenshot: bool) !void {
         var worker = Worker{ .pid = 0, .connection = index, .fd = -1, .screenshot = screenshot };
         var image_fd: c_int = -1;
         if (screenshot) {
@@ -155,8 +152,7 @@ const Service = struct {
         const pid = c.fork();
         if (pid < 0) return error.ForkFailed;
         if (pid == 0) {
-            // No worker can survive a daemon crash. Close all transports before
-            // Wayland/FFmpeg initialization so EOF is never held open by a child.
+            // No worker can survive a daemon crash or hold client EOF open.
             if (c.prctl(c.PR_SET_PDEATHSIG, c.SIGKILL, @as(c_ulong, 0), @as(c_ulong, 0), @as(c_ulong, 0)) != 0 or c.getppid() != parent) c._exit(1);
             _ = c.close(self.listener);
             _ = c.close(self.directory);
@@ -164,12 +160,7 @@ const Service = struct {
             for (&self.connections) |connection| if (connection.fd >= 0) {
                 _ = c.close(connection.fd);
             };
-            var caption: [128]u8 = undefined;
-            var name: [40]u8 = undefined;
-            const size = @min(name.len, parameters.context.app_id.len);
-            for (parameters.context.app_id[0..size], 0..) |byte, i| name[i] = if (byte >= 32 and byte < 127) byte else '?';
-            const label = std.fmt.bufPrintZ(&caption, "Claimed app: {s} (caller PID {d})", .{ name[0..size], self.connections[index].pid }) catch unreachable;
-            const color = capture(self.environ, screenshot, parameters.interactive, label, image_fd) catch |err| {
+            const color = capture(screenshot, image_fd) catch |err| {
                 std.debug.print("ouroshot-service: capture: {s}\n", .{@errorName(err)});
                 writeAll(pipe[1], if (err == error.Cancelled) "C" else "F") catch {};
                 c._exit(0);
@@ -322,7 +313,7 @@ const Service = struct {
                         slot = connection;
                         break;
                     };
-                    if (slot) |connection| connection.* = .{ .fd = fd, .pid = credentials.pid, .deadline = client.now() + self.timeout_ns } else {
+                    if (slot) |connection| connection.* = .{ .fd = fd, .deadline = client.now() + self.timeout_ns } else {
                         _ = c.send(fd, busy.ptr, busy.len, c.MSG_NOSIGNAL);
                         _ = c.close(fd);
                     }
@@ -336,7 +327,7 @@ const Service = struct {
     }
 };
 
-fn capture(environ: std.process.Environ, screenshot: bool, interactive: bool, caption: [:0]const u8, image_fd: c_int) ![3]f64 {
+fn capture(screenshot: bool, image_fd: c_int) ![3]f64 {
     if (fixture) {
         // Only in the separately named test binary, never in ouroshot-service.
         // stdin is a deterministic UI gate: S=accept, C=cancel, F=fail.
@@ -347,40 +338,7 @@ fn capture(environ: std.process.Environ, screenshot: bool, interactive: bool, ca
         if (screenshot and c.shot_png_fd(image_fd, &[_]u8{ 51, 102, 204, 255, 17, 34, 68, 255 }, 2, 1) != 0) return error.PngWriteFailed;
         return .{ 0.8, 0.4, 0.2 };
     }
-    {
-        // The selector owns one Wayland interaction per connection. Finish and
-        // close consent completely before starting the capture/selection phase.
-        var permission: client.Client = undefined;
-        try permission.init(environ);
-        defer permission.deinit();
-        permission.caption = caption;
-        permission.customize = interactive;
-        permission.service_ui = if (screenshot) .screenshot else .color;
-        _ = try permission.select(false);
-    }
-    var app: client.Client = undefined;
-    try app.init(environ);
-    defer app.deinit();
-    _ = try app.capture(false, null);
-    if (screenshot) {
-        app.service_ui = .region;
-        const region = if (interactive) try app.select(true) else app.bounds();
-        var image = try app.compose(region);
-        defer image.deinit(allocator);
-        if (c.shot_png_fd(image_fd, image.data.ptr, @intCast(image.width), @intCast(image.height)) != 0) return error.PngWriteFailed;
-        return .{ 0, 0, 0 };
-    }
-    app.service_ui = .pick;
-    _ = try app.select(true);
-    for (app.outputs[0..app.output_count]) |output| {
-        if (!output.rect.contains(app.position)) continue;
-        const image = output.snapshot orelse return error.MissingCapture;
-        const x: u32 = @intFromFloat((app.precise_x - @as(f64, @floatFromInt(output.rect.x))) * @as(f64, @floatFromInt(image.width)) / @as(f64, @floatFromInt(output.rect.width)));
-        const y: u32 = @intFromFloat((app.precise_y - @as(f64, @floatFromInt(output.rect.y))) * @as(f64, @floatFromInt(image.height)) / @as(f64, @floatFromInt(output.rect.height)));
-        const pixel = image.pixel(@min(x, image.width - 1), @min(y, image.height - 1));
-        return .{ @as(f64, @floatFromInt(pixel[2])) / 255, @as(f64, @floatFromInt(pixel[1])) / 255, @as(f64, @floatFromInt(pixel[0])) / 255 };
-    }
-    return error.GeometryOutsideOutputs;
+    return error.CaptureUnavailable;
 }
 
 fn errno() c_int {
@@ -426,17 +384,12 @@ pub fn main(init: std.process.Init) void {
 fn run(init: std.process.Init) !void {
     c.shot_signals();
     _ = c.umask(0o077);
-    var srgb = false;
     var idle_ms: i64 = 30_000;
     var timeout_ms: i64 = 300_000;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--capture-source-srgb")) {
-            srgb = true;
-            continue;
-        }
-        if (std.mem.eql(u8, args[i], "--help")) return writeAll(1, "ouroshot-service [--capture-source-srgb] [--idle-ms N] [--timeout-ms N]\nSocket: $XDG_RUNTIME_DIR/ouro/capture.sock, or systemd LISTEN_FDS=1.\nPickColor fails unless the desktop guarantees sRGB screencopy bytes.\n");
+        if (std.mem.eql(u8, args[i], "--help")) return writeAll(1, "ouroshot-service [--idle-ms N] [--timeout-ms N]\nSocket: $XDG_RUNTIME_DIR/ouro/capture.sock, or systemd LISTEN_FDS=1.\nScreenshot and PickColor are unavailable until native UI is implemented.\n");
         if (i + 1 >= args.len) return error.UnknownOption;
         if (std.mem.eql(u8, args[i], "--idle-ms")) idle_ms = try std.fmt.parseInt(i64, args[i + 1], 10) else if (std.mem.eql(u8, args[i], "--timeout-ms")) timeout_ms = try std.fmt.parseInt(i64, args[i + 1], 10) else return error.UnknownOption;
         i += 1;
@@ -490,7 +443,7 @@ fn run(init: std.process.Init) !void {
     defer allocator.free(capture_path);
     const service = try allocator.create(Service);
     defer allocator.destroy(service);
-    service.* = .{ .listener = listener, .directory = directory, .capture_path = capture_path, .environ = init.minimal.environ, .srgb = srgb, .timeout_ns = timeout_ms * 1_000_000 };
+    service.* = .{ .listener = listener, .directory = directory, .capture_path = capture_path, .timeout_ns = timeout_ms * 1_000_000 };
     defer for (0..service.connections.len) |index| service.close(index);
     try service.loop(idle_ms * 1_000_000);
 }

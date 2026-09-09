@@ -128,7 +128,7 @@ class TransportTests(unittest.TestCase):
         self.service = self.start()
 
     def start(self, args=(), listener=None):
-        service = Service(self.runtime, ["--capture-source-srgb", *args], listener)
+        service = Service(self.runtime, args, listener)
         self.services.append(service)
         return service
 
@@ -309,15 +309,8 @@ class TransportTests(unittest.TestCase):
             with self.service.connect(frame()) as s:
                 self.service.pending()
                 self.service.gate(command)
-                self.assertEqual(response(s)["error"], IFACE + "." + error)
+                self.assertEqual(response(s), {"error": IFACE + "." + error, "parameters": {}})
             self.assertEqual(list(self.service.captures.iterdir()), [])
-
-    def test_fail_closed_without_native_srgb_configuration(self):
-        self.service.stop()
-        self.service = Service(self.runtime)
-        self.services.append(self.service)
-        self.error(frame("PickColor"), IFACE + ".Failed")
-        self.assertFalse(self.service.workers())
 
     def test_connection_limit(self):
         sockets = [self.service.connect() for _ in range(64)]

@@ -56,7 +56,7 @@ pub fn build(b: *std.Build) void {
     });
     app.addIncludePath(b.path("src"));
     app.addCSourceFile(.{ .file = b.path("src/encode.c"), .flags = &.{ "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-Wall", "-Wextra" } });
-    for ([_][]const u8{ "libpng", "libavcodec", "libavformat", "libavutil", "libavfilter", "libswscale", "libva", "gbm", "libdrm", "cairo" }) |lib| app.linkSystemLibrary(lib, .{});
+    for ([_][]const u8{ "libpng", "libavcodec", "libavformat", "libavutil", "libavfilter", "libswscale", "libva", "gbm", "libdrm" }) |lib| app.linkSystemLibrary(lib, .{});
     const exe = b.addExecutable(.{ .name = "ouroshot", .root_module = app });
     b.installArtifact(exe);
     const run = b.addRunArtifact(exe);
@@ -78,7 +78,7 @@ pub fn build(b: *std.Build) void {
         service.addAnonymousImport("capture_idl", .{ .root_source_file = b.path("protocol/dev.rockorager.ouro.Capture.varlink") });
         service.addIncludePath(b.path("src"));
         service.addCSourceFile(.{ .file = b.path("src/encode.c"), .flags = &.{ "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-Wall", "-Wextra" } });
-        for ([_][]const u8{ "libpng", "libavcodec", "libavformat", "libavutil", "libavfilter", "libswscale", "libva", "gbm", "libdrm", "cairo" }) |lib| service.linkSystemLibrary(lib, .{});
+        for ([_][]const u8{ "libpng", "libavcodec", "libavformat", "libavutil", "libavfilter", "libswscale", "libva", "gbm", "libdrm" }) |lib| service.linkSystemLibrary(lib, .{});
         b.installArtifact(b.addExecutable(.{ .name = if (index == 0) "ouroshot-service" else "ouroshot-service-fixture", .root_module = service }));
     }
 }
