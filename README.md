@@ -191,7 +191,7 @@ unchanged. Only `PickColor` is deferred and returns
 
 The [MCP wire contract](protocol/mcp.md) uses newline-delimited JSON-RPC 2.0
 with protocol version `2026-07-28`. Connections support discovery and repeated
-requests; each frame is limited to 64 KiB including its newline. Tool calls
+requests; each frame is limited to 4 MiB (4194304 bytes) including its newline. Tool calls
 return complete results, not streaming responses or subscriptions.
 There are at most 64 live connections and one capture worker. Overlapping
 screenshots return `Busy`; the listener remains responsive during selection.
@@ -284,7 +284,7 @@ with socket.socket(socket.AF_UNIX) as sock:
     sock.connect(os.environ["XDG_RUNTIME_DIR"] + "/ouro/capture.mcp.sock")
     sock.sendall(json.dumps(request).encode() + b"\n")
     with sock.makefile("rb") as stream:
-        print(json.loads(stream.readline(65536)))
+        print(json.loads(stream.readline(4 * 1024 * 1024 + 1)))
 PY
 ```
 

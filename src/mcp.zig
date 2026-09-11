@@ -2,7 +2,7 @@
 const std = @import("std");
 
 pub const version = "2026-07-28";
-pub const limit = 65536; // Includes the terminating newline.
+pub const limit = 4 * 1024 * 1024; // Includes the terminating newline.
 pub const Value = std.json.Value;
 pub const Context = struct { app_id: []const u8, parent_window: []const u8, origin: []const u8, require_confirmation: bool, permission_store_checked: bool };
 pub const Parameters = struct { context: Context, modal: bool, interactive: bool };

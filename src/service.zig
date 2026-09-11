@@ -24,11 +24,12 @@ const c = @cImport({
 });
 const allocator = std.heap.smp_allocator;
 const limit = mcp.limit;
+const output_queue_limit = limit;
+const receive_chunk = 16 * 1024;
 
 const Connection = struct {
     fd: c_int = -1,
-    input: [limit]u8 = undefined,
-    used: usize = 0,
+    input: std.ArrayList(u8) = .empty,
     output: ?[]u8 = null,
     sent: usize = 0,
     pending_id: ?[]u8 = null,
@@ -39,7 +40,7 @@ const Connection = struct {
         defer allocator.free(json);
         if (json.len >= limit) return error.ReplyTooLarge;
         const prior = if (self.output) |output| output[self.sent..] else "";
-        if (prior.len + json.len + 1 > limit * 4) return error.OutputCapacity;
+        if (prior.len + json.len + 1 > output_queue_limit) return error.OutputCapacity;
         const output = try allocator.alloc(u8, prior.len + json.len + 1);
         @memcpy(output[0..prior.len], prior);
         @memcpy(output[prior.len..][0..json.len], json);
@@ -106,16 +107,16 @@ const Service = struct {
         const connection = &self.connections[index];
         if (self.worker != null and self.worker.?.connection == index) self.cancel();
         if (connection.fd >= 0) _ = c.close(connection.fd);
+        connection.input.deinit(allocator);
         if (connection.output) |output| allocator.free(output);
         connection.* = .{};
     }
 
     fn request(self: *Service, index: usize, bytes: []const u8) !void {
         const connection = &self.connections[index];
-        // Parsing is bounded independently of frame size (including nested JSON).
-        var memory: [1024 * 1024]u8 = undefined;
-        var fixed = std.heap.FixedBufferAllocator.init(&memory);
-        const a = fixed.allocator();
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
         const parsed = std.json.parseFromSlice(mcp.Value, a, bytes, .{ .parse_numbers = false }) catch return connection.rpcError(.null, -32700, "Parse error");
         const root = parsed.value;
         if (root != .object or !mcp.isString(field(root, "jsonrpc"), "2.0") or field(root, "method") != .string)
@@ -239,7 +240,7 @@ const Service = struct {
     fn finish(self: *Service) !void {
         const worker = if (self.worker) |*value| value else return;
         const connection = &self.connections[worker.connection];
-        if (connection.output != null or connection.used != 0) return;
+        if (connection.output != null or connection.input.items.len != 0) return;
         const n = c.read(worker.fd, worker.bytes[worker.used..].ptr, worker.bytes.len - worker.used);
         if (n > 0) {
             worker.used += @intCast(n);
@@ -321,32 +322,40 @@ const Service = struct {
                     self.close(i);
                     continue;
                 }
-                if (connection.used < limit and events & (c.POLLIN | c.POLLHUP) != 0) {
-                    const buffer = connection.input[connection.used..];
+                if (connection.input.items.len < limit and events & (c.POLLIN | c.POLLHUP) != 0) {
+                    const available = limit - connection.input.items.len;
+                    const chunk = @min(receive_chunk, available);
+                    if (connection.input.capacity - connection.input.items.len < chunk) {
+                        const desired = @min(limit, @max(connection.input.items.len + chunk, @max(receive_chunk, connection.input.capacity * 2)));
+                        connection.input.ensureTotalCapacityPrecise(allocator, desired) catch {
+                            self.close(i);
+                            continue;
+                        };
+                    }
+                    const buffer = connection.input.unusedCapacitySlice()[0..chunk];
                     const count = c.recv(connection.fd, buffer.ptr, buffer.len, c.MSG_DONTWAIT);
                     if (count == 0 or (count < 0 and errno() != c.EAGAIN and errno() != c.EINTR)) {
                         self.close(i);
                         continue;
                     }
                     if (count > 0) {
-                        if (connection.used == 0 and connection.pending_id == null and connection.output == null)
+                        if (connection.input.items.len == 0 and connection.pending_id == null and connection.output == null)
                             connection.deadline = client.now() + self.timeout_ns;
-                        connection.used += @intCast(count);
+                        connection.input.items.len += @intCast(count);
                     }
                 }
                 // Bound work per client/tick and leave partial frames buffered.
                 for (0..16) |_| {
-                    const input = connection.input[0..connection.used];
+                    const input = connection.input.items;
                     const end = std.mem.indexOfScalar(u8, input, '\n') orelse break;
                     self.request(i, input[0..end]) catch {
                         self.close(i);
                         break;
                     };
-                    std.mem.copyForwards(u8, &connection.input, input[end + 1 ..]);
-                    connection.used -= end + 1;
+                    connection.input.replaceRange(allocator, 0, end + 1, "") catch unreachable;
                 }
                 if (connection.fd < 0) continue;
-                if (connection.used == limit and std.mem.indexOfScalar(u8, connection.input[0..connection.used], '\n') == null) {
+                if (connection.input.items.len == limit and std.mem.indexOfScalar(u8, connection.input.items, '\n') == null) {
                     self.close(i);
                     continue;
                 }

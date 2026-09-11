@@ -27,6 +27,7 @@ EXE = str(
     ).resolve()
 )
 VERSION = "2026-07-28"
+WIRE_LIMIT = 4 * 1024 * 1024
 META = {
     "io.modelcontextprotocol/protocolVersion": VERSION,
     "io.modelcontextprotocol/clientCapabilities": {},
@@ -247,16 +248,24 @@ class TransportTests(unittest.TestCase):
         params = copy.deepcopy(PARAMS)
         baseline = tool_frame(params=params, request_id=request_id)
         params["context"]["app_id"] = "x" * (
-            65536 - len(baseline) + len(params["context"]["app_id"])
+            WIRE_LIMIT - len(baseline) + len(params["context"]["app_id"])
         )
         data = tool_frame(params=params, request_id=request_id)
-        self.assertEqual(len(data), 65536)
+        self.assertEqual(len(data), WIRE_LIMIT)
         with self.service.connect(data) as s:
             self.service.pending()
             self.service.gate(b"C")
             reply = response(s)
             self.assertEqual(reply["id"], request_id)
             tool_error(reply, "Cancelled")
+
+        # Growth past the former cap remains valid without allocating the wire
+        # maximum for idle connections.
+        params["context"]["app_id"] = "x" * 65536
+        with self.service.connect(tool_frame(params=params, request_id="large")) as s:
+            self.service.pending()
+            self.service.gate(b"C")
+            self.assertEqual(response(s)["id"], "large")
 
     def test_invalid_frames_ids_metadata_and_versions(self):
         for data, code in (
@@ -286,8 +295,21 @@ class TransportTests(unittest.TestCase):
         reply = self.service.call(json.dumps(request).encode() + b"\n")
         self.assertEqual(reply["error"]["code"], -32022)
         self.assertEqual(reply["error"]["data"]["supported"], [VERSION])
-        with self.service.connect(b"x" * 65536) as s:
-            self.assertEqual(s.recv(1), b"")
+        with self.service.connect(b"x" * WIRE_LIMIT) as s:
+            try:
+                closed = s.recv(1)
+            except ConnectionResetError:
+                closed = b""
+            self.assertEqual(closed, b"")
+        # An over-limit sender is discarded, and cannot replay bytes into a
+        # fresh connection occupying the same service slot.
+        with self.service.connect(b"x" * (WIRE_LIMIT + 1)) as s:
+            try:
+                closed = s.recv(1)
+            except ConnectionResetError:
+                closed = b""
+            self.assertEqual(closed, b"")
+        self.assertEqual(self.service.call(frame("tools/list", {}, "clean"))["id"], "clean")
 
     def test_discovery_and_descriptor_equality(self):
         discover = self.service.call(frame("server/discover", {}, "d"))

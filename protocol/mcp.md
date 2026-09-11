@@ -1,8 +1,8 @@
 # Ouro capture MCP contract
 
 The endpoint is `$XDG_RUNTIME_DIR/ouro/capture.mcp.sock`. Frames are JSON-RPC
-2.0 objects encoded as compact JSON followed by one newline, at most 65536
-bytes including the newline. Each request has a string or integer `id`, echoed
+2.0 objects encoded as compact JSON followed by one newline, at most 4 MiB
+(4194304 bytes) including the newline. Each request has a string or integer `id`, echoed
 unchanged in its response. Connections support multiple requests. There is no
 initialize handshake, streaming, or subscription support.
 
