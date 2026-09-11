@@ -1,7 +1,8 @@
 const std = @import("std");
 const client = @import("client.zig");
 const fixture = @import("service_options").fixture;
-const idl = @embedFile("capture_idl");
+const mcp = @import("mcp.zig");
+const field = mcp.field;
 const c = @cImport({
     @cUndef("_FORTIFY_SOURCE");
     @cDefine("_GNU_SOURCE", "1");
@@ -22,11 +23,7 @@ const c = @cImport({
     @cInclude("encode.h");
 });
 const allocator = std.heap.smp_allocator;
-const interface = "dev.rockorager.ouro.Capture";
-const limit = 65536; // Includes the terminating NUL.
-const Context = struct { app_id: []const u8, parent_window: []const u8, origin: []const u8, require_confirmation: bool, permission_store_checked: bool };
-const Parameters = struct { context: Context, modal: bool, interactive: bool };
-const Request = struct { method: []const u8, parameters: std.json.Value = .null, more: bool = false, oneway: bool = false, upgrade: bool = false };
+const limit = mcp.limit;
 
 const Connection = struct {
     fd: c_int = -1,
@@ -34,23 +31,42 @@ const Connection = struct {
     used: usize = 0,
     output: ?[]u8 = null,
     sent: usize = 0,
-    pending: bool = false,
+    pending_id: ?[]u8 = null,
     deadline: i64 = 0,
 
     fn reply(self: *Connection, value: anytype) anyerror!void {
-        const json = try std.json.Stringify.valueAlloc(allocator, value, .{});
+        const json = try std.json.Stringify.valueAlloc(allocator, value, .{ .emit_null_optional_fields = false });
         defer allocator.free(json);
-        if (json.len >= limit) return self.invalid("request");
-        self.output = try allocator.alloc(u8, json.len + 1);
-        @memcpy(self.output.?[0..json.len], json);
-        self.output.?[json.len] = 0;
-        self.pending = false;
+        if (json.len >= limit) return error.ReplyTooLarge;
+        const prior = if (self.output) |output| output[self.sent..] else "";
+        if (prior.len + json.len + 1 > limit * 4) return error.OutputCapacity;
+        const output = try allocator.alloc(u8, prior.len + json.len + 1);
+        @memcpy(output[0..prior.len], prior);
+        @memcpy(output[prior.len..][0..json.len], json);
+        output[output.len - 1] = '\n';
+        if (self.output) |old| allocator.free(old);
+        self.output = output;
+        self.sent = 0;
     }
-    fn failure(self: *Connection, name: []const u8) !void {
-        try self.reply(.{ .@"error" = name, .parameters = struct {}{} });
+    fn rpcError(self: *Connection, id: mcp.Value, code: i32, message: []const u8) !void {
+        try self.reply(.{ .jsonrpc = "2.0", .id = if (id == .null) @as(?mcp.Value, null) else id, .@"error" = .{ .code = code, .message = message } });
     }
-    fn invalid(self: *Connection, parameter: []const u8) !void {
-        try self.reply(.{ .@"error" = "org.varlink.service.InvalidParameter", .parameters = .{ .parameter = parameter } });
+    fn toolResult(self: *Connection, id: mcp.Value, data: anytype, is_error: bool) !void {
+        const text = try std.json.Stringify.valueAlloc(allocator, data, .{});
+        defer allocator.free(text);
+        try self.reply(.{ .jsonrpc = "2.0", .id = id, .result = .{
+            .resultType = "complete",
+            .content = .{.{ .type = "text", .text = text }},
+            .structuredContent = data,
+            .isError = is_error,
+        } });
+    }
+    fn failure(self: *Connection, id: mcp.Value, code: []const u8) !void {
+        try self.toolResult(id, .{ .@"error" = .{ .code = code, .message = code } }, true);
+    }
+    fn clearPending(self: *Connection) void {
+        if (self.pending_id) |id| allocator.free(id);
+        self.pending_id = null;
     }
 };
 
@@ -82,6 +98,7 @@ const Service = struct {
             }
             _ = c.close(worker.fd);
             if (worker.image_fd >= 0) _ = c.close(worker.image_fd);
+            self.connections[worker.connection].clearPending();
             self.worker = null;
         }
     }
@@ -98,33 +115,73 @@ const Service = struct {
         // Parsing is bounded independently of frame size (including nested JSON).
         var memory: [1024 * 1024]u8 = undefined;
         var fixed = std.heap.FixedBufferAllocator.init(&memory);
-        const parsed = std.json.parseFromSlice(Request, fixed.allocator(), bytes, .{}) catch return connection.invalid("request");
-        const request_value = parsed.value;
-        if (request_value.more or request_value.oneway or request_value.upgrade) return connection.invalid("flags");
-        if (std.mem.eql(u8, request_value.method, "org.varlink.service.GetInfo")) {
-            return connection.reply(.{ .parameters = .{ .vendor = "rockorager", .product = "ouroshot", .version = "0.0.0", .url = "https://github.com/rockorager/ouroshot", .interfaces = .{ "org.varlink.service", interface } } });
+        const a = fixed.allocator();
+        const parsed = std.json.parseFromSlice(mcp.Value, a, bytes, .{ .parse_numbers = false }) catch return connection.rpcError(.null, -32700, "Parse error");
+        const root = parsed.value;
+        if (root != .object or !mcp.isString(field(root, "jsonrpc"), "2.0") or field(root, "method") != .string)
+            return connection.rpcError(.null, -32600, "Invalid request");
+        const params = field(root, "params");
+        const method = field(root, "method").string;
+        if (!root.object.contains("id")) {
+            if (std.mem.eql(u8, method, "notifications/cancelled") and connection.pending_id != null) {
+                const id = field(params, "requestId");
+                if (mcp.validId(id)) {
+                    const encoded = try std.json.Stringify.valueAlloc(a, id, .{});
+                    if (std.mem.eql(u8, encoded, connection.pending_id.?)) self.cancel();
+                }
+            }
+            return;
         }
-        if (std.mem.eql(u8, request_value.method, "org.varlink.service.GetInterfaceDescription")) {
-            const params = std.json.parseFromValue(struct { interface: []const u8 }, fixed.allocator(), request_value.parameters, .{}) catch return connection.invalid("parameters");
-            if (std.mem.eql(u8, params.value.interface, interface)) return connection.reply(.{ .parameters = .{ .description = idl } });
-            if (std.mem.eql(u8, params.value.interface, "org.varlink.service")) return connection.reply(.{ .parameters = .{ .description = service_idl } });
-            return connection.reply(.{ .@"error" = "org.varlink.service.InterfaceNotFound", .parameters = .{ .interface = params.value.interface } });
+        const id = field(root, "id");
+        if (!mcp.validId(id)) return connection.rpcError(.null, -32600, "Invalid request ID");
+        const encoded_id = try std.json.Stringify.valueAlloc(a, id, .{});
+        if (connection.pending_id) |pending| if (std.mem.eql(u8, pending, encoded_id))
+            return connection.rpcError(id, -32600, "Request ID already active");
+        const meta = field(params, "_meta");
+        if (params != .object or meta != .object or field(meta, "io.modelcontextprotocol/protocolVersion") != .string or field(meta, "io.modelcontextprotocol/clientCapabilities") != .object)
+            return connection.rpcError(id, -32602, "Required request metadata missing or invalid");
+        if (!mcp.isString(field(meta, "io.modelcontextprotocol/protocolVersion"), mcp.version)) {
+            return connection.reply(.{ .jsonrpc = "2.0", .id = id, .@"error" = .{
+                .code = -32022,
+                .message = "Unsupported protocol version",
+                .data = .{ .supported = .{mcp.version}, .requested = field(meta, "io.modelcontextprotocol/protocolVersion") },
+            } });
         }
-        const screenshot = std.mem.eql(u8, request_value.method, interface ++ ".Screenshot");
-        if (!screenshot and !std.mem.eql(u8, request_value.method, interface ++ ".PickColor")) {
-            const dot = std.mem.lastIndexOfScalar(u8, request_value.method, '.') orelse return connection.invalid("method");
-            const name = request_value.method[0..dot];
-            if (!std.mem.eql(u8, name, interface) and !std.mem.eql(u8, name, "org.varlink.service")) return connection.reply(.{ .@"error" = "org.varlink.service.InterfaceNotFound", .parameters = .{ .interface = name } });
-            return connection.reply(.{ .@"error" = "org.varlink.service.MethodNotFound", .parameters = .{ .method = request_value.method[dot + 1 ..] } });
+        if (std.mem.eql(u8, method, "server/discover")) {
+            if (params.object.count() != 1) return connection.rpcError(id, -32602, "Invalid params");
+            return connection.reply(.{ .jsonrpc = "2.0", .id = id, .result = .{
+                .resultType = "complete",
+                .supportedVersions = .{mcp.version},
+                .capabilities = .{ .tools = struct {}{} },
+                ._meta = .{ .@"io.modelcontextprotocol/serverInfo" = .{ .name = "ouroshot", .version = "0.0.0" } },
+                .ttlMs = 60000,
+                .cacheScope = "private",
+            } });
         }
-        _ = std.json.parseFromValue(Parameters, fixed.allocator(), request_value.parameters, .{}) catch return connection.invalid("parameters");
+        if (std.mem.eql(u8, method, "tools/list")) {
+            if (params.object.count() != 1) return connection.rpcError(id, -32602, "Invalid params");
+            return connection.reply(.{ .jsonrpc = "2.0", .id = id, .result = .{
+                .resultType = "complete",
+                .tools = try mcp.tools(a),
+                .ttlMs = 60000,
+                .cacheScope = "private",
+            } });
+        }
+        if (!std.mem.eql(u8, method, "tools/call")) return connection.rpcError(id, -32601, "Method not found");
+        const name = field(params, "name");
+        const screenshot = mcp.isString(name, "Screenshot");
+        if (!screenshot and !mcp.isString(name, "PickColor")) return connection.rpcError(id, -32602, "Unknown tool");
+        if (params.object.count() != 3) return connection.rpcError(id, -32602, "Invalid params");
+        _ = std.json.parseFromValue(mcp.Parameters, a, field(params, "arguments"), .{}) catch return connection.rpcError(id, -32602, "Invalid arguments");
         // Color selection is deferred. Screenshots use the existing selector;
         // caller hints never bypass the user's explicit region selection.
-        if (!fixture and !screenshot) return connection.failure(interface ++ ".Failed");
-        if (self.worker != null) return connection.failure(interface ++ ".Busy");
+        if (!fixture and !screenshot) return connection.failure(id, "Failed");
+        if (self.worker != null) return connection.failure(id, "Busy");
+        connection.pending_id = try allocator.dupe(u8, encoded_id);
         self.start(index, screenshot) catch |err| {
+            connection.clearPending();
             std.debug.print("ouroshot-service: start: {s}\n", .{@errorName(err)});
-            return connection.failure(interface ++ ".Failed");
+            return connection.failure(id, "Failed");
         };
     }
 
@@ -177,11 +234,12 @@ const Service = struct {
         worker.fd = pipe[0];
         worker.image_fd = image_fd;
         self.worker = worker;
-        self.connections[index].pending = true;
     }
 
     fn finish(self: *Service) !void {
         const worker = if (self.worker) |*value| value else return;
+        const connection = &self.connections[worker.connection];
+        if (connection.output != null or connection.used != 0) return;
         const n = c.read(worker.fd, worker.bytes[worker.used..].ptr, worker.bytes.len - worker.used);
         if (n > 0) {
             worker.used += @intCast(n);
@@ -189,24 +247,28 @@ const Service = struct {
         }
         if (n < 0 and (errno() == c.EAGAIN or errno() == c.EINTR)) return;
         const index = worker.connection;
+        // The worker has exited and closed the PNG before this point. Recheck
+        // EOF *before* commit; after commit even an ambiguous send retains it.
+        var probe: u8 = 0;
+        const live = c.recv(self.connections[index].fd, &probe, 1, c.MSG_PEEK | c.MSG_DONTWAIT);
+        if (live > 0) return; // Process cancellation/input before committing.
+        if (live == 0 or (errno() != c.EAGAIN and errno() != c.EINTR) or client.now() >= connection.deadline or c.shot_stopping() != 0) {
+            self.close(index);
+            return;
+        }
         var status: c_int = 0;
         const waited = c.waitpid(worker.pid, &status, c.WNOHANG);
         if (waited == 0 or (waited < 0 and errno() == c.EINTR)) return;
         worker.pid = 0; // Reaped: cleanup must never signal a reused PID.
         if (waited < 0) status = 1;
-        // The worker has exited and closed the PNG before this point. Recheck
-        // EOF *before* commit; after commit even an ambiguous send retains it.
-        var probe: u8 = 0;
-        const live = c.recv(self.connections[index].fd, &probe, 1, c.MSG_PEEK | c.MSG_DONTWAIT);
-        if (live >= 0 or (errno() != c.EAGAIN and errno() != c.EINTR) or client.now() >= self.connections[index].deadline or c.shot_stopping() != 0) {
-            self.close(index);
-            return;
-        }
+        const parsed_id = try std.json.parseFromSlice(mcp.Value, allocator, connection.pending_id.?, .{ .parse_numbers = false });
+        defer parsed_id.deinit();
+        const id = parsed_id.value;
         const result = worker.bytes[0..worker.used];
         if (status != 0 or result.len == 0 or std.mem.eql(u8, result, "F")) {
-            try self.connections[index].failure(interface ++ ".Failed");
+            try connection.failure(id, "Failed");
         } else if (std.mem.eql(u8, result, "C")) {
-            try self.connections[index].failure(interface ++ ".Cancelled");
+            try connection.failure(id, "Cancelled");
         } else if (worker.screenshot and std.mem.eql(u8, result, "S")) {
             const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ self.capture_path, std.mem.sliceTo(&worker.final_name, 0) });
             defer allocator.free(path);
@@ -214,7 +276,7 @@ const Service = struct {
             defer allocator.free(uri);
             // Allocate the complete reply before the artifact commit. OOM cannot
             // commit an image without even attempting its final reply.
-            try self.connections[index].reply(.{ .parameters = .{ .uri = uri } });
+            try connection.toolResult(id, .{ .uri = uri }, false);
             var fd_path: [64]u8 = undefined;
             const source = try std.fmt.bufPrintZ(&fd_path, "/proc/self/fd/{d}", .{worker.image_fd});
             // linkat is atomic and cannot overwrite. /proc/self/fd permits an
@@ -222,22 +284,20 @@ const Service = struct {
             if (c.linkat(c.AT_FDCWD, source, self.directory, &worker.final_name, c.AT_SYMLINK_FOLLOW) != 0) {
                 allocator.free(self.connections[index].output.?);
                 self.connections[index].output = null;
-                try self.connections[index].failure(interface ++ ".Failed");
+                try connection.failure(id, "Failed");
             }
         } else if (!worker.screenshot) {
             const parsed = std.json.parseFromSlice([3]f64, allocator, result, .{}) catch {
-                try self.connections[index].failure(interface ++ ".Failed");
+                try connection.failure(id, "Failed");
                 self.cancel();
                 return;
             };
             defer parsed.deinit();
             for (parsed.value) |component| if (!std.math.isFinite(component) or component < 0 or component > 1) return error.InvalidWorkerColor;
-            try self.connections[index].reply(.{ .parameters = .{ .color = parsed.value } });
-        } else try self.connections[index].failure(interface ++ ".Failed");
+            try connection.toolResult(id, .{ .color = parsed.value }, false);
+        } else try connection.failure(id, "Failed");
         // Reaped already; do not signal a potentially reused PID.
-        _ = c.close(worker.fd);
-        if (worker.image_fd >= 0) _ = c.close(worker.image_fd);
-        self.worker = null;
+        self.cancel();
     }
 
     fn loop(self: *Service, idle_ns: i64) !void {
@@ -261,25 +321,34 @@ const Service = struct {
                     self.close(i);
                     continue;
                 }
-                if (events & (c.POLLIN | c.POLLHUP) != 0) {
-                    var extra: [1]u8 = undefined;
-                    const buffer = if (connection.pending or connection.output != null) &extra else connection.input[connection.used..];
+                if (connection.used < limit and events & (c.POLLIN | c.POLLHUP) != 0) {
+                    const buffer = connection.input[connection.used..];
                     const count = c.recv(connection.fd, buffer.ptr, buffer.len, c.MSG_DONTWAIT);
                     if (count == 0 or (count < 0 and errno() != c.EAGAIN and errno() != c.EINTR)) {
                         self.close(i);
                         continue;
                     }
                     if (count > 0) {
-                        if (connection.pending or connection.output != null) {
-                            self.close(i);
-                            continue;
-                        }
+                        if (connection.used == 0 and connection.pending_id == null and connection.output == null)
+                            connection.deadline = client.now() + self.timeout_ns;
                         connection.used += @intCast(count);
-                        const input = connection.input[0..connection.used];
-                        if (std.mem.indexOfScalar(u8, input, 0)) |end| {
-                            if (end + 1 != input.len) try connection.invalid("framing") else try self.request(i, input[0..end]);
-                        } else if (connection.used == limit) try connection.invalid("request");
                     }
+                }
+                // Bound work per client/tick and leave partial frames buffered.
+                for (0..16) |_| {
+                    const input = connection.input[0..connection.used];
+                    const end = std.mem.indexOfScalar(u8, input, '\n') orelse break;
+                    self.request(i, input[0..end]) catch {
+                        self.close(i);
+                        break;
+                    };
+                    std.mem.copyForwards(u8, &connection.input, input[end + 1 ..]);
+                    connection.used -= end + 1;
+                }
+                if (connection.fd < 0) continue;
+                if (connection.used == limit and std.mem.indexOfScalar(u8, connection.input[0..connection.used], '\n') == null) {
+                    self.close(i);
+                    continue;
                 }
                 if (connection.fd >= 0 and connection.output != null and events & c.POLLOUT != 0) {
                     const output = connection.output.?;
@@ -288,10 +357,16 @@ const Service = struct {
                         self.close(i);
                         continue;
                     }
-                    if (connection.sent == output.len) self.close(i);
+                    if (connection.sent == output.len) {
+                        allocator.free(output);
+                        connection.output = null;
+                        connection.sent = 0;
+                    }
                 }
             }
-            if (self.worker != null and polls[65].revents != 0) try self.finish();
+            if (self.worker) |worker| if (polls[65].revents != 0) {
+                self.finish() catch self.close(worker.connection);
+            };
             if (polls[0].revents & c.POLLIN != 0) {
                 // Bound accepts per tick; a connect flood must not starve EOF.
                 for (0..16) |_| {
@@ -305,7 +380,7 @@ const Service = struct {
                     var credentials: c.struct_ucred = undefined;
                     var size: c.socklen_t = @sizeOf(c.struct_ucred);
                     if (c.getsockopt(fd, c.SOL_SOCKET, c.SO_PEERCRED, &credentials, &size) != 0 or size != @sizeOf(c.struct_ucred) or credentials.uid != c.geteuid()) {
-                        _ = c.send(fd, denied.ptr, denied.len, c.MSG_NOSIGNAL);
+                        // No request ID exists yet; reject the transport.
                         _ = c.close(fd);
                         continue;
                     }
@@ -315,7 +390,6 @@ const Service = struct {
                         break;
                     };
                     if (slot) |connection| connection.* = .{ .fd = fd, .deadline = client.now() + self.timeout_ns } else {
-                        _ = c.send(fd, busy.ptr, busy.len, c.MSG_NOSIGNAL);
                         _ = c.close(fd);
                     }
                 }
@@ -401,7 +475,11 @@ fn run(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--help")) return writeAll(1, "ouroshot-service [--idle-ms N] [--timeout-ms N]\nSocket: $XDG_RUNTIME_DIR/ouro/capture.sock, or systemd LISTEN_FDS=1.\nScreenshot uses the existing region selector. PickColor is not yet available.\n");
+        if (std.mem.eql(u8, args[i], "--help")) return writeAll(1, "ouroshot-service [--idle-ms N] [--timeout-ms N] [--export-mcp-descriptor]\nMCP socket: $XDG_RUNTIME_DIR/ouro/capture.mcp.sock, or systemd LISTEN_FDS=1.\nScreenshot uses the existing region selector. PickColor is not yet available.\n");
+        if (std.mem.eql(u8, args[i], "--export-mcp-descriptor")) {
+            try writeAll(1, try mcp.descriptor(init.arena.allocator()));
+            return writeAll(1, "\n");
+        }
         if (i + 1 >= args.len) return error.UnknownOption;
         if (std.mem.eql(u8, args[i], "--idle-ms")) idle_ms = try std.fmt.parseInt(i64, args[i + 1], 10) else if (std.mem.eql(u8, args[i], "--timeout-ms")) timeout_ms = try std.fmt.parseInt(i64, args[i + 1], 10) else return error.UnknownOption;
         i += 1;
@@ -415,7 +493,7 @@ fn run(init: std.process.Init) !void {
     defer _ = c.close(ouro);
     const directory = try privateDirectory(ouro, "captures", true);
     defer _ = c.close(directory);
-    const path = try std.fmt.allocPrintSentinel(allocator, "{s}/ouro/capture.sock", .{runtime}, 0);
+    const path = try std.fmt.allocPrintSentinel(allocator, "{s}/ouro/capture.mcp.sock", .{runtime}, 0);
     defer allocator.free(path);
     var address: c.struct_sockaddr_un = std.mem.zeroes(c.struct_sockaddr_un);
     address.sun_family = c.AF_UNIX;
@@ -441,15 +519,15 @@ fn run(init: std.process.Init) !void {
         errdefer _ = c.close(listener);
         // Do not unlink an existing endpoint: it could belong to a live daemon.
         if (c.bind(listener, .{ .__sockaddr_un__ = &address }, @sizeOf(c.struct_sockaddr_un)) != 0) return error.BindFailed;
-        errdefer _ = c.unlinkat(ouro, "capture.sock", 0);
+        errdefer _ = c.unlinkat(ouro, "capture.mcp.sock", 0);
         if (c.chmod(path, 0o600) != 0 or c.listen(listener, 64) != 0) return error.ListenFailed;
     }
     defer _ = c.close(listener);
     defer if (!activated) {
-        _ = c.unlinkat(ouro, "capture.sock", 0);
+        _ = c.unlinkat(ouro, "capture.mcp.sock", 0);
     };
     var socket_stat: c.struct_stat = undefined;
-    if (c.fstatat(ouro, "capture.sock", &socket_stat, c.AT_SYMLINK_NOFOLLOW) != 0 or socket_stat.st_uid != c.geteuid() or socket_stat.st_mode & c.S_IFMT != c.S_IFSOCK or socket_stat.st_mode & 0o777 != 0o600) return error.UnsafeSocket;
+    if (c.fstatat(ouro, "capture.mcp.sock", &socket_stat, c.AT_SYMLINK_NOFOLLOW) != 0 or socket_stat.st_uid != c.geteuid() or socket_stat.st_mode & c.S_IFMT != c.S_IFSOCK or socket_stat.st_mode & 0o777 != 0o600) return error.UnsafeSocket;
     if (c.fcntl(listener, c.F_SETFL, @as(c_int, c.O_NONBLOCK)) != 0 or c.fcntl(listener, c.F_SETFD, @as(c_int, c.FD_CLOEXEC)) != 0) return error.InvalidActivation;
     const capture_path = try std.fmt.allocPrint(allocator, "{s}/ouro/captures", .{runtime});
     defer allocator.free(capture_path);
@@ -459,15 +537,3 @@ fn run(init: std.process.Init) !void {
     defer for (0..service.connections.len) |index| service.close(index);
     try service.loop(idle_ms * 1_000_000);
 }
-
-const denied = "{\"error\":\"dev.rockorager.ouro.Capture.Denied\",\"parameters\":{}}\x00";
-const busy = "{\"error\":\"dev.rockorager.ouro.Capture.Busy\",\"parameters\":{}}\x00";
-const service_idl =
-    \\interface org.varlink.service
-    \\method GetInfo() -> (vendor: string, product: string, version: string, url: string, interfaces: []string)
-    \\method GetInterfaceDescription(interface: string) -> (description: string)
-    \\error InterfaceNotFound(interface: string)
-    \\error MethodNotFound(method: string)
-    \\error MethodNotImplemented(method: string)
-    \\error InvalidParameter(parameter: string)
-;

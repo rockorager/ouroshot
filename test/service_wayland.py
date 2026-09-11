@@ -17,7 +17,7 @@ from urllib.parse import unquote, urlparse
 
 from PIL import Image, ImageChops
 from pointer import Pointer, cursor_environment
-from service import Service, PARAMS, IFACE, frame, response, until
+from service import Service, PARAMS, response, structured, tool_error, tool_frame, until
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--executable", default="zig-out/bin/ouroshot-service")
@@ -91,26 +91,26 @@ try:
     for interactive in (False, True):
         params = copy.deepcopy(PARAMS)
         params["interactive"] = interactive
-        with service.connect(frame(params=params)) as sock:
+        with service.connect(tool_frame(params=params)) as sock:
             service.pending()
             time.sleep(.3)
             assert not select.select([sock], [], [], .1)[0], "succeeded without selection"
-            assert service.call(frame())["error"] == IFACE + ".Busy"
+            tool_error(service.call(tool_frame()), "Busy")
             screen("pending.png")
             drag()
-            equal(saved(response(sock)["parameters"]["uri"]), expected)
+            equal(saved(structured(response(sock))["uri"]), expected)
     print("PASS real Screenshot: both interactive hints require selection, Busy, exact 150% pixels, no card", flush=True)
 
     for disconnect in (False, True):
         before = set(service.captures.iterdir())
-        with service.connect(frame()) as sock:
+        with service.connect(tool_frame()) as sock:
             service.pending()
             time.sleep(.3)
             if disconnect:
                 sock.close()
             else:
                 cancel()
-                assert response(sock) == {"error": IFACE + ".Cancelled", "parameters": {}}
+                tool_error(response(sock), "Cancelled")
         until(lambda: not service.workers())
         time.sleep(.15)
         equal(screen("disconnected.png" if disconnect else "cancelled.png"), baseline)

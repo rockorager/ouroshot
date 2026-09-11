@@ -75,10 +75,16 @@ pub fn build(b: *std.Build) void {
         const options = b.addOptions();
         options.addOption(bool, "fixture", index == 1);
         service.addOptions("service_options", options);
-        service.addAnonymousImport("capture_idl", .{ .root_source_file = b.path("protocol/dev.rockorager.ouro.Capture.varlink") });
         service.addIncludePath(b.path("src"));
         service.addCSourceFile(.{ .file = b.path("src/encode.c"), .flags = &.{ "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-Wall", "-Wextra" } });
         for ([_][]const u8{ "libpng", "libavcodec", "libavformat", "libavutil", "libavfilter", "libswscale", "libva", "gbm", "libdrm" }) |lib| service.linkSystemLibrary(lib, .{});
-        b.installArtifact(b.addExecutable(.{ .name = if (index == 0) "ouroshot-service" else "ouroshot-service-fixture", .root_module = service }));
+        const service_exe = b.addExecutable(.{ .name = if (index == 0) "ouroshot-service" else "ouroshot-service-fixture", .root_module = service });
+        b.installArtifact(service_exe);
+        if (index == 0) {
+            const export_mcp = b.addRunArtifact(service_exe);
+            export_mcp.addArg("--export-mcp-descriptor");
+            const descriptor = b.addInstallFile(export_mcp.captureStdOut(.{}), "share/ouro/mcp/apps/ouroshot.json");
+            b.getInstallStep().dependOn(&descriptor.step);
+        }
     }
 }

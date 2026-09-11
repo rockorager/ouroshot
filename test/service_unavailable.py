@@ -14,7 +14,7 @@ import socket
 import subprocess
 import tempfile
 
-from service import Service, PARAMS, IFACE, frame, until
+from service import Service, PARAMS, structured, tool_error, tool_frame, until
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--executable", default="zig-out/bin/ouroshot-service")
@@ -38,9 +38,9 @@ with tempfile.TemporaryDirectory(prefix="ouroshot-unavailable-") as directory:
                 for interactive in (False, True):
                     params = copy.deepcopy(PARAMS)
                     params["interactive"] = interactive
-                    assert service.call(frame(method, params)) == {"error": IFACE + ".Failed", "parameters": {}}
+                    tool_error(service.call(tool_frame(method, params)), "Failed")
                     params["context"].update(require_confirmation=True, permission_store_checked=False, origin="xdg-desktop-portal")
-                    assert service.call(frame(method, params)) == {"error": IFACE + ".Failed", "parameters": {}}
+                    tool_error(service.call(tool_frame(method, params)), "Failed")
             assert not service.workers()
             assert not list(service.captures.iterdir())
             assert not select.select([wayland], [], [], .1)[0], "service contacted Wayland"
