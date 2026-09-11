@@ -145,6 +145,7 @@ pub const Client = struct {
     position: geo.Point = .{ .x = 0, .y = 0 },
     anchor: ?geo.Point = null,
     selection: ?geo.Rect = null,
+    confirming: bool = false,
     failure: ?anyerror = null,
 
     pub fn init(self: *Client, environ: std.process.Environ) !void {
@@ -511,10 +512,35 @@ pub const Client = struct {
         return result;
     }
 
-    pub fn select(self: *Client, freeze: bool) !geo.Rect {
+    pub fn resolveTarget(self: *Client, monitor: ?[]const u8, region: ?geo.Rect) !?geo.Rect {
+        if (monitor) |name| {
+            var found: ?geo.Rect = null;
+            for (self.outputs[0..self.output_count]) |output| {
+                if (!std.mem.eql(u8, std.mem.sliceTo(&output.name, 0), name)) continue;
+                if (found != null) return error.AmbiguousMonitor;
+                found = output.rect;
+            }
+            const output = found orelse return error.UnknownMonitor;
+            return if (region) |r| try r.relativeTo(output) else output;
+        }
+        if (region) |r| {
+            if (!r.valid()) return error.InvalidGeometry;
+            const overlap = self.bounds().intersection(r) orelse return error.GeometryOutsideOutputs;
+            if (!std.meta.eql(overlap, r)) return error.GeometryOutsideOutputs;
+            for (self.outputs[0..self.output_count]) |output| {
+                if (output.rect.intersection(r) != null) return r;
+            }
+            return error.GeometryOutsideOutputs;
+        }
+        return null;
+    }
+
+    pub fn select(self: *Client, freeze: bool, preset: ?geo.Rect) !geo.Rect {
         const layers = self.layers orelse return error.LayerShellUnsupported;
         if (self.seat == null) return error.NoInputSeat;
         self.freeze = freeze;
+        self.selection = preset;
+        self.confirming = preset != null;
         for (self.outputs[0..self.output_count]) |*output| {
             const queue = &(try self.connection.actor()).transmit;
             output.surface = (try p.wl_compositor.construct_create_surface(&self.connection.objects, queue, self.compositor.?, .{ .id = .{ .context = output } })).id;
@@ -740,6 +766,7 @@ pub const Client = struct {
                 },
                 .key => |e| {
                     if (e.key == 1 and e.state.value == 1) self.cancelled = true;
+                    if (self.selecting and self.confirming and (e.key == 28 or e.key == 96) and e.state.value == 1) self.selected = true;
                 },
                 else => {},
             }
@@ -761,6 +788,15 @@ pub const Client = struct {
                     if (!self.selecting) return;
                     if (e.button == 273 and e.state.value == 1) self.cancelled = true;
                     if (e.button == 272) {
+                        if (self.confirming) {
+                            if (e.state.value == 1) {
+                                self.anchor = if (self.selection.?.contains(self.position)) self.position else null;
+                            } else {
+                                self.selected = self.anchor != null and self.selection.?.contains(self.position);
+                                self.anchor = null;
+                            }
+                            return;
+                        }
                         if (e.state.value == 1) self.anchor = self.position else if (self.anchor != null) {
                             const rect = geo.Rect.between(self.anchor.?, self.position);
                             if (rect.width > 0 and rect.height > 0) {
@@ -874,6 +910,7 @@ pub const Client = struct {
         const index = self.pointer_output orelse return;
         const output = &self.outputs[index];
         self.position = .{ .x = output.rect.x + @divFloor(x, 256), .y = output.rect.y + @divFloor(y, 256) };
+        if (self.confirming) return;
         if (self.anchor) |anchor| {
             self.selection = geo.Rect.between(anchor, self.position);
             for (self.outputs[0..self.output_count]) |*other| other.dirty = true;

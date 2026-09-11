@@ -5,7 +5,25 @@ pub const version = "2026-07-28";
 pub const limit = 4 * 1024 * 1024; // Includes the terminating newline.
 pub const Value = std.json.Value;
 pub const Context = struct { app_id: []const u8, parent_window: []const u8, origin: []const u8, require_confirmation: bool, permission_store_checked: bool };
-pub const Parameters = struct { context: Context, modal: bool, interactive: bool };
+pub const Parameters = struct {
+    context: Context,
+    modal: bool,
+    interactive: bool,
+    monitor: ?[]const u8 = null,
+    region: ?@import("geometry.zig").Rect = null,
+};
+
+pub fn parameters(a: std.mem.Allocator, value: Value, screenshot: bool) !Parameters {
+    const args = try std.json.parseFromValueLeaky(Parameters, a, value, .{});
+    for ([_][]const u8{ "monitor", "region" }) |key| {
+        if (value.object.contains(key) and (!screenshot or field(value, key) == .null)) return error.InvalidTarget;
+    }
+    if (args.monitor) |monitor| {
+        if (monitor.len == 0 or monitor.len > 255 or std.mem.indexOfScalar(u8, monitor, 0) != null) return error.InvalidTarget;
+    }
+    if (args.region) |region| if (!region.valid()) return error.InvalidTarget;
+    return args;
+}
 
 pub fn field(value: Value, name: []const u8) Value {
     return if (value == .object) value.object.get(name) orelse .null else .null;
@@ -39,13 +57,22 @@ const color_schema =
 
 /// The caller's arena owns the parsed schemas and returned tool values.
 pub fn tools(a: std.mem.Allocator) !Value {
-    const input = (try std.json.parseFromSlice(Value, a, input_schema, .{})).value;
     const failure = (try std.json.parseFromSlice(Value, a, error_schema, .{})).value;
     var list = std.array_list.Managed(Value).init(a);
     inline for (.{
-        .{ "Screenshot", "Share a region selected by the user as a private PNG file URI. Every call requires native user selection; caller hints never grant consent.", screenshot_schema },
+        .{ "Screenshot", "Share a monitor or region as a private PNG file URI. With a target, the user confirms the highlighted area by clicking inside or pressing Enter; Escape/right click cancels. Without a target, the user drags to select. Every call requires native consent; caller hints never authorize capture.", screenshot_schema },
         .{ "PickColor", "Pick an sRGB color with native user consent. Currently unavailable; returns Failed without capturing or opening UI.", color_schema },
     }) |entry| {
+        var input = (try std.json.parseFromSlice(Value, a, input_schema, .{})).value;
+        if (std.mem.eql(u8, entry[0], "Screenshot")) {
+            const properties = &input.object.getPtr("properties").?.object;
+            try properties.put(a, "monitor", (try std.json.parseFromSlice(Value, a,
+                \\{"type":"string","minLength":1,"maxLength":255,"pattern":"^[^\\u0000]+$","description":"Wayland output name, e.g. DP-1. With region, coordinates are relative to this monitor's top-left; without region, select the whole monitor."}
+            , .{})).value);
+            try properties.put(a, "region", (try std.json.parseFromSlice(Value, a,
+                \\{"type":"object","additionalProperties":false,"required":["x","y","width","height"],"description":"Rectangle in logical coordinates: monitor-relative when monitor is supplied, otherwise desktop-wide. A monitor-relative rectangle must fit entirely within that monitor.","properties":{"x":{"type":"integer","minimum":-1000000,"maximum":1000000},"y":{"type":"integer","minimum":-1000000,"maximum":1000000},"width":{"type":"integer","minimum":1,"maximum":32768},"height":{"type":"integer","minimum":1,"maximum":32768}}}
+            , .{})).value);
+        }
         const success = (try std.json.parseFromSlice(Value, a, entry[2], .{})).value;
         const encoded = try std.json.Stringify.valueAlloc(a, .{
             .name = entry[0],

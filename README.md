@@ -182,11 +182,15 @@ normal screenshot, geometry and recording commands do not acquire service
 consent prompts. No D-Bus code runs in ouroshot. The separately developed
 ourobridge Screenshot adapter translates portal requests to this native API.
 
-**Screenshot works through the existing frozen-region selector.** Complete a
-drag to share that region, or Escape/right click to cancel. There is no separate
-confirmation card. Region selection is required even when `interactive=false`:
-caller hints never grant automatic full-desktop capture. Direct CLI behavior is
-unchanged. Only `PickColor` is deferred and returns
+**Screenshot works through the existing frozen-region selector.** Without a
+target, drag to select a region. Callers may instead supply a Wayland output
+name (`monitor`), a logical-coordinate rectangle (`region`), or both. A region
+is desktop-global unless paired with a monitor, when it is monitor-relative and
+must fit entirely within that output. A monitor alone targets the whole output.
+Targeted captures highlight the preset and require Enter or a press and release
+inside it. Escape or right click cancels either flow. There is no separate
+confirmation card, and `interactive=false` never bypasses native consent.
+Direct CLI behavior is unchanged. Only `PickColor` is deferred and returns
 `Failed` (portal response 2 through ourobridge).
 
 The [MCP wire contract](protocol/mcp.md) uses newline-delimited JSON-RPC 2.0
@@ -248,7 +252,7 @@ The service's Cairo consent card, region instructions and color picker have
 been removed pending a future UI design. Ouroshot does not link Cairo or Pango.
 Screenshots reuse the CLI selector without changing its appearance. The frozen
 preview is captured locally before selection; nothing is published or returned
-until the user selects a nonempty region. `modal`, `interactive` and
+until the user selects or confirms a nonempty region. `modal`, `interactive` and
 `parent_window` remain hints, not authority. There is currently no app-attribution
 display or parent-window attachment.
 
@@ -314,7 +318,8 @@ PNG modes/URI encoding, and idle exit/reactivation with retained results.
 
 The unavailable-method test verifies PickColor fails regardless of caller hints,
 without a worker, image, or attempted Wayland connection. The Wayland test checks
-real Screenshot selection and exact pixels at 150%, Busy, cancellation and EOF.
+drag and preset consent, multi-output monitor-relative and desktop-global targets,
+exact fractional-scale pixels, Busy, cancellation, EOF, and rejection instead of clipping.
 Optional real ourobridge integration checks Screenshot success, native cancel,
 Request.Close, and deferred PickColor failure. It does not test document export.
 

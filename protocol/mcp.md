@@ -19,8 +19,15 @@ unknown methods return -32601; unknown tools or invalid arguments return -32602.
 ```
 
 Context is attribution and hints, never authorization. The service checks peer
-credentials and requires native region selection for every Screenshot. PickColor
-is currently unavailable and returns Failed without capturing or opening UI.
+credentials and requires native consent for every Screenshot. Without a target,
+the user drags a region. Screenshot also accepts an optional Wayland output name
+as `monitor` and an optional logical rectangle as
+`region: {"x":100,"y":60,"width":210,"height":130}`. Region coordinates are
+desktop-global without `monitor`, and monitor-relative with it; monitor-relative
+regions must fit entirely within the output and are never clipped. `monitor`
+alone targets the entire output. A preset requires Enter or a pointer press and
+release inside it; Escape or right click cancels. PickColor does not accept
+targets and is currently unavailable, returning Failed without opening UI.
 
 A successful response contains `result` with `resultType: "complete"`,
 `isError: false`, `structuredContent`, and one `content` item of type `text` whose

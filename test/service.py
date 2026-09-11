@@ -325,7 +325,37 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(exported, installed)
         self.assertEqual(exported["tools"], tools)
         self.assertEqual(exported["endpoint"]["runtime_path"], "ouro/capture.mcp.sock")
+        shot = tools[0]["inputSchema"]
+        self.assertEqual(shot["required"], ["context", "modal", "interactive"])
+        self.assertEqual(set(shot["properties"]), {"context", "modal", "interactive", "monitor", "region"})
+        self.assertEqual(shot["properties"]["region"]["properties"], {
+            "x": {"type": "integer", "minimum": -1000000, "maximum": 1000000},
+            "y": {"type": "integer", "minimum": -1000000, "maximum": 1000000},
+            "width": {"type": "integer", "minimum": 1, "maximum": 32768},
+            "height": {"type": "integer", "minimum": 1, "maximum": 32768},
+        })
+        self.assertEqual(set(tools[1]["inputSchema"]["properties"]), {"context", "modal", "interactive"})
         self.rpc_error(frame("absent", {}), -32601, 1)
+
+    def test_target_arguments_and_consent_gate(self):
+        region = {"x": 37, "y": 91, "width": 401, "height": 203}
+        for target in ({"monitor": "DP-1"}, {"region": region}, {"monitor": "DP-1", "region": region}):
+            with self.service.connect(tool_frame(params=PARAMS | target)) as sock:
+                self.service.pending()
+                self.assertFalse(select.select([sock], [], [], .1)[0])
+                self.service.gate(b"C")
+                tool_error(response(sock), "Cancelled")
+            until(lambda: not self.service.workers())
+        for target in (
+            {"monitor": ""}, {"monitor": None}, {"monitor": "bad\0name"}, {"monitor": "x" * 256},
+            {"region": None}, {"region": {}}, {"region": region | {"extra": 1}},
+            {"region": region | {"width": 0}}, {"region": region | {"height": -1}},
+            {"region": region | {"width": 32769}}, {"region": region | {"x": 1000001}},
+            {"region": region | {"y": 1.5}},
+        ):
+            self.rpc_error(tool_frame(params=PARAMS | target), -32602, 1)
+        self.rpc_error(tool_frame("PickColor", params=PARAMS | {"monitor": "DP-1"}), -32602, 1)
+        self.assertFalse(list(self.service.captures.iterdir()))
 
     def test_backpressure_tools_list(self):
         data = b"".join(frame("tools/list", {}, i) for i in range(80))

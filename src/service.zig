@@ -173,20 +173,19 @@ const Service = struct {
         const screenshot = mcp.isString(name, "Screenshot");
         if (!screenshot and !mcp.isString(name, "PickColor")) return connection.rpcError(id, -32602, "Unknown tool");
         if (params.object.count() != 3) return connection.rpcError(id, -32602, "Invalid params");
-        _ = std.json.parseFromValue(mcp.Parameters, a, field(params, "arguments"), .{}) catch return connection.rpcError(id, -32602, "Invalid arguments");
-        // Color selection is deferred. Screenshots use the existing selector;
-        // caller hints never bypass the user's explicit region selection.
+        const arguments = mcp.parameters(a, field(params, "arguments"), screenshot) catch return connection.rpcError(id, -32602, "Invalid arguments");
+        // Targets preselect geometry, never authorize sharing without the UI.
         if (!fixture and !screenshot) return connection.failure(id, "Failed");
         if (self.worker != null) return connection.failure(id, "Busy");
         connection.pending_id = try allocator.dupe(u8, encoded_id);
-        self.start(index, screenshot) catch |err| {
+        self.start(index, screenshot, arguments) catch |err| {
             connection.clearPending();
             std.debug.print("ouroshot-service: start: {s}\n", .{@errorName(err)});
             return connection.failure(id, "Failed");
         };
     }
 
-    fn start(self: *Service, index: usize, screenshot: bool) !void {
+    fn start(self: *Service, index: usize, screenshot: bool, arguments: mcp.Parameters) !void {
         var worker = Worker{ .pid = 0, .connection = index, .fd = -1, .screenshot = screenshot };
         var image_fd: c_int = -1;
         if (screenshot) {
@@ -219,7 +218,7 @@ const Service = struct {
             for (&self.connections) |connection| if (connection.fd >= 0) {
                 _ = c.close(connection.fd);
             };
-            const color = capture(self.environ, screenshot, image_fd) catch |err| {
+            const color = capture(self.environ, screenshot, image_fd, arguments) catch |err| {
                 std.debug.print("ouroshot-service: capture: {s}\n", .{@errorName(err)});
                 writeAll(pipe[1], if (err == error.Cancelled) "C" else "F") catch {};
                 c._exit(0);
@@ -411,7 +410,7 @@ const Service = struct {
     }
 };
 
-fn capture(environ: std.process.Environ, screenshot: bool, image_fd: c_int) ![3]f64 {
+fn capture(environ: std.process.Environ, screenshot: bool, image_fd: c_int, arguments: mcp.Parameters) ![3]f64 {
     if (fixture) {
         // Only in the separately named test binary, never in ouroshot-service.
         // stdin is a deterministic UI gate: S=accept, C=cancel, F=fail.
@@ -426,10 +425,10 @@ fn capture(environ: std.process.Environ, screenshot: bool, image_fd: c_int) ![3]
     var app: client.Client = undefined;
     try app.init(environ);
     defer app.deinit();
+    const preset = try app.resolveTarget(arguments.monitor, arguments.region);
     _ = try app.capture(false, null);
-    // Reuse the CLI's frozen selector: finishing a drag approves only that
-    // region. No separate card, automatic full-desktop capture or new UI.
-    const region = try app.select(true);
+    // The frozen overlay requires a drag or explicit preset confirmation.
+    const region = try app.select(true, preset);
     var image = try app.compose(region);
     defer image.deinit(allocator);
     if (c.shot_png_fd(image_fd, image.data.ptr, @intCast(image.width), @intCast(image.height)) != 0) return error.PngWriteFailed;

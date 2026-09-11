@@ -126,7 +126,7 @@ fn run(init: std.process.Init) !void {
     const interactive = !options.fullscreen and options.geometry == null;
     const frozen = interactive and !options.live and !options.record and !options.geometry_only;
     if (frozen) _ = try app.capture(options.cursor, null);
-    const region = if (options.geometry) |r| r.intersection(app.bounds()) orelse return error.GeometryOutsideOutputs else if (options.fullscreen) app.bounds() else try app.select(frozen);
+    const region = if (options.geometry) |r| r.intersection(app.bounds()) orelse return error.GeometryOutsideOutputs else if (options.fullscreen) app.bounds() else try app.select(frozen, null);
     if (options.geometry_only) {
         try write(try std.fmt.bufPrint(&text, "{d},{d} {d}x{d}\n", .{ region.x, region.y, region.width, region.height }));
     } else if (options.record) {

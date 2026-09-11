@@ -19,6 +19,22 @@ pub const Rect = struct {
     pub fn contains(r: Rect, p: Point) bool {
         return p.x >= r.x and p.y >= r.y and p.x < r.right() and p.y < r.bottom();
     }
+    pub fn valid(r: Rect) bool {
+        return r.width > 0 and r.height > 0 and r.width <= 32768 and r.height <= 32768 and
+            @abs(@as(i64, r.x)) <= 1_000_000 and @abs(@as(i64, r.y)) <= 1_000_000;
+    }
+    pub fn relativeTo(r: Rect, output: Rect) !Rect {
+        if (!r.valid() or r.x < 0 or r.y < 0 or r.right() > output.width or r.bottom() > output.height)
+            return error.GeometryOutsideOutput;
+        const absolute = Rect{
+            .x = std.math.cast(i32, @as(i64, output.x) + r.x) orelse return error.InvalidGeometry,
+            .y = std.math.cast(i32, @as(i64, output.y) + r.y) orelse return error.InvalidGeometry,
+            .width = r.width,
+            .height = r.height,
+        };
+        if (!absolute.valid()) return error.InvalidGeometry;
+        return absolute;
+    }
     pub fn intersection(a: Rect, b: Rect) ?Rect {
         const x = @max(a.x, b.x);
         const y = @max(a.y, b.y);
@@ -71,4 +87,22 @@ test "negative output origins, reverse drag, and half-open intersections" {
     try std.testing.expectEqual(@as(u32, 127), try pixels(101, 150));
     try std.testing.expectError(error.InvalidGeometry, Rect.parse("0,0 0x10"));
     try std.testing.expectError(error.InvalidGeometry, Rect.parse("0,0 10x10 extra"));
+}
+
+test "monitor-relative regions translate logical origins without clipping" {
+    const output = Rect{ .x = -1920, .y = 120, .width = 1280, .height = 720 };
+    const region = Rect{ .x = 37, .y = 91, .width = 401, .height = 203 };
+    try std.testing.expectEqual(Rect{ .x = -1883, .y = 211, .width = 401, .height = 203 }, try region.relativeTo(output));
+    const edge = Rect{ .x = 1000, .y = 500, .width = 280, .height = 220 };
+    try std.testing.expectEqual(Rect{ .x = -920, .y = 620, .width = 280, .height = 220 }, try edge.relativeTo(output));
+    var outside = edge;
+    outside.width += 1;
+    try std.testing.expectError(error.GeometryOutsideOutput, outside.relativeTo(output));
+    outside = region;
+    outside.x = -1;
+    try std.testing.expectError(error.GeometryOutsideOutput, outside.relativeTo(output));
+    outside = region;
+    outside.height = 0;
+    try std.testing.expectError(error.GeometryOutsideOutput, outside.relativeTo(output));
+    try std.testing.expectError(error.InvalidGeometry, region.relativeTo(.{ .x = std.math.maxInt(i32), .y = 0, .width = 1280, .height = 720 }));
 }

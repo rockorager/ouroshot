@@ -117,6 +117,74 @@ try:
         assert set(service.captures.iterdir()) == before
     print("PASS real selection cancellation and EOF: UI dismissed, no extra artifacts", flush=True)
 
+    # Add a monitor left of and below the first, with a different scale.
+    subprocess.run(["swaymsg", "create_output"], env=env, check=True, capture_output=True)
+    subprocess.run(["swaymsg", "output HEADLESS-2 mode 800x600 scale 1 position -800 80"], env=env, check=True, capture_output=True)
+    second = Image.new("RGB", (800, 600))
+    second.putdata([((x * 7 + 11) % 256, (y * 3 + 29) % 256, (x * 2 + y + 41) % 256) for y in range(600) for x in range(800)])
+    second.save(runtime / "second.png")
+    subprocess.run(["swaymsg", "output", "HEADLESS-2", "bg", str(runtime / "second.png"), "stretch"], env=env, check=True, capture_output=True)
+    time.sleep(.3)
+    pointer.width, pointer.height = 1440, 680
+
+    def output_screen(name, monitor, scale):
+        path = art / name
+        subprocess.run(["grim", "-o", monitor, "-s", str(scale), str(path)], env=env, check=True, capture_output=True)
+        return Image.open(path).convert("RGB")
+
+    second_base = output_screen("second-baseline.png", "HEADLESS-2", 1)
+    equal(second_base, second)
+    region = {"x": 100, "y": 60, "width": 210, "height": 130}
+    cases = [
+        ("monitor-region", {"monitor": "HEADLESS-2", "region": region}, second_base.crop((100, 60, 310, 190)), (-650, 170)),
+        ("global-region", {"region": region | {"x": -700, "y": 140}}, second_base.crop((100, 60, 310, 190)), (-650, 170)),
+        ("whole-monitor", {"monitor": "HEADLESS-2"}, second_base, (-650, 170)),
+        ("fractional-region", {"monitor": "HEADLESS-1", "region": region}, baseline.crop((150, 90, 465, 285)), (150, 90)),
+    ]
+    for name, target, pixels, point in cases:
+        with service.connect(tool_frame(params=PARAMS | target)) as sock:
+            service.pending()
+            time.sleep(.3)
+            assert not select.select([sock], [], [], .1)[0], "target bypassed confirmation"
+            # Pressing outside and releasing inside must not authorize capture.
+            pointer.move(1300, 350)
+            pointer.button(1)
+            pointer.move(point[0] + 800, point[1])
+            pointer.button(0)
+            time.sleep(.1)
+            assert not select.select([sock], [], [], .1)[0], "outside press approved target"
+            output_screen(name + ".png", target.get("monitor", "HEADLESS-2"), 1.5 if name == "fractional-region" else 1)
+            # grim's temporary capture can disturb pointer focus; refresh it
+            # inside the preset before the approving press and release.
+            pointer.move(point[0] + 800, point[1])
+            pointer.button(1)
+            pointer.button(0)
+            reply = response(sock)
+            assert not reply["result"]["isError"], (name, reply)
+            equal(saved(structured(reply)["uri"]), pixels)
+        until(lambda: not service.workers())
+
+    before = set(service.captures.iterdir())
+    for target in ({"monitor": "missing"}, {"monitor": "HEADLESS-2", "region": region | {"x": 591}},
+                   {"monitor": "HEADLESS-2", "region": region | {"x": -1}},
+                   {"region": region | {"x": -801}}, {"region": {"x": -700, "y": 0, "width": 100, "height": 50}}):
+        tool_error(service.call(tool_frame(params=PARAMS | target)), "Failed")
+    for disconnect in (False, True):
+        with service.connect(tool_frame(params=PARAMS | {"monitor": "HEADLESS-2", "region": region})) as sock:
+            service.pending()
+            time.sleep(.3)
+            if disconnect:
+                sock.close()
+            else:
+                subprocess.run(["wtype", "-k", "Escape"], env=env, check=True)
+                tool_error(response(sock), "Cancelled")
+        until(lambda: not service.workers())
+    assert set(service.captures.iterdir()) == before
+    print("PASS monitor/global/relative targeting, fractional pixels, click consent, invalid targets, cancellation and EOF", flush=True)
+    subprocess.run(["swaymsg", "output HEADLESS-2 disable"], env=env, check=True, capture_output=True)
+    pointer.width, pointer.height = 640, 400
+    time.sleep(.3)
+
     if args.bridge:
         assert os.environ.get("OUROSHOT_PRIVATE_TEST_BUS") == "1"
         import dbus
