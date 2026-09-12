@@ -200,7 +200,9 @@ try:
             if disconnect:
                 sock.close()
             else:
-                subprocess.run(["wtype", "-k", "Escape"], env=env, check=True)
+                # The headless seat has no persistent keyboard. Allow the
+                # selector to bind the new device before injecting Escape.
+                subprocess.run(["wtype", "-s", "200", "-k", "Escape", "-s", "100"], env=env, check=True)
                 tool_error(response(sock), "Cancelled")
         until(lambda: not service.workers())
     assert set(service.captures.iterdir()) == before
