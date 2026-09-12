@@ -18,6 +18,7 @@ from urllib.parse import unquote, urlparse
 from PIL import Image, ImageChops
 from pointer import Pointer, cursor_environment
 from service import Service, PARAMS, response, structured, tool_error, tool_frame, until
+from encoding import chunks, expected_channel
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--executable", default="zig-out/bin/ouroshot-service")
@@ -100,6 +101,29 @@ try:
             drag()
             equal(saved(structured(response(sock))["uri"]), expected)
     print("PASS real Screenshot: both interactive hints require selection, Busy, exact 150% pixels, no card", flush=True)
+
+    # Desktop-selected encoding reaches the real worker without changing the
+    # raw preview. It cannot be selected or overridden by an MCP caller.
+    service.stop()
+    service = Service(runtime, ["--source-encoding", "gamma22"], executable=str(Path(args.executable).resolve()), env=env)
+    with service.connect(tool_frame()) as sock:
+        service.pending()
+        time.sleep(.3)
+        pointer.move(100, 120)
+        pointer.button(1)
+        pointer.move(310, 270)
+        time.sleep(.15)
+        preview = screen("gamma22-selection.png")
+        assert preview.getpixel((200, 220)) == baseline.getpixel((200, 220))
+        pointer.button(0)
+        uri = structured(response(sock))["uri"]
+        equal(saved(uri), expected.point([expected_channel(i) for i in range(256)] * 3))
+        path = Path(unquote(urlparse(uri).path))
+        assert b"sRGB" in chunks(path)
+        shutil.copyfile(path, art / "gamma22-export.png")
+    service.stop()
+    service = Service(runtime, executable=str(Path(args.executable).resolve()), env=env)
+    print("PASS production gamma22 service export with unchanged raw frozen preview", flush=True)
 
     for disconnect in (False, True):
         before = set(service.captures.iterdir())

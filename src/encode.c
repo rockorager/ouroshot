@@ -1,6 +1,7 @@
 #include "encode.h"
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,12 +36,41 @@ void shot_signals(void) {
 }
 int shot_stopping(void) { return stopping; }
 
+int shot_source_encoding(const char *name) {
+    if (!strcmp(name, "unknown")) return SHOT_SOURCE_UNKNOWN;
+    if (!strcmp(name, "srgb")) return SHOT_SOURCE_SRGB;
+    if (!strcmp(name, "gamma22")) return SHOT_SOURCE_GAMMA22;
+    return -1;
+}
+static void gamma22_lut(uint8_t lut[256]) {
+    for (int i = 0; i < 256; i++) {
+        double linear = pow(i / 255.0, 2.2);
+        double srgb = linear <= 0.0031308 ? 12.92 * linear : 1.055 * pow(linear, 1.0 / 2.4) - 0.055;
+        lut[i] = (uint8_t)floor(srgb * 255.0 + 0.5);
+    }
+}
+// Straight RGB only: alpha is linear coverage, never a transfer-encoded channel.
+// Do not mutate capture storage: it is also the untagged frozen preview source.
+static void convert_rgb(uint8_t *dst, const uint8_t *src, int width, const uint8_t lut[256]) {
+    for (int x = 0; x < width; x++) {
+        for (int c = 0; c < 3; c++) dst[x*4+c] = lut[src[x*4+c]];
+        dst[x*4+3] = src[x*4+3];
+    }
+}
+
 // Takes ownership of fd, including on error. The service creates it relative
 // to a verified private directory; it never reopens a caller-supplied path.
-// Do not attach sRGB/gamma metadata to compositor bytes of unknown color space.
-int shot_png_fd(int fd, const uint8_t *bgra, int width, int height) {
+// Unknown sources retain their bytes and have no color-space declaration.
+int shot_png_fd(int fd, const uint8_t *bgra, int width, int height, int source_encoding) {
     FILE *file = fdopen(fd, "wb");
     if (!file) { close(fd); return -1; }
+    uint8_t lut[256];
+    uint8_t *row = NULL;
+    if (source_encoding == SHOT_SOURCE_GAMMA22) {
+        gamma22_lut(lut);
+        row = malloc((size_t)width * 4);
+        if (!row) { fclose(file); return -1; }
+    }
     png_structp png = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
     png_infop info = png ? png_create_info_struct(png) : NULL;
     int ok = 0;
@@ -48,34 +78,30 @@ int shot_png_fd(int fd, const uint8_t *bgra, int width, int height) {
         png_init_io(png, file);
         png_set_IHDR(png, info, width, height, 8, PNG_COLOR_TYPE_RGBA,
                      PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+        if (source_encoding != SHOT_SOURCE_UNKNOWN) png_set_sRGB(png, info, PNG_sRGB_INTENT_RELATIVE);
         png_set_bgr(png);
         png_write_info(png, info);
-        for (int y = 0; y < height; y++) png_write_row(png, bgra + (size_t)y * width * 4);
+        for (int y = 0; y < height; y++) {
+            const uint8_t *src = bgra + (size_t)y * width * 4;
+            if (row) convert_rgb(row, src, width, lut);
+            png_write_row(png, row ? row : src);
+        }
         png_write_end(png, info);
         ok = 1;
     }
     png_destroy_write_struct(&png, &info);
+    free(row);
     if (fclose(file)) ok = 0;
     return ok ? 0 : -1;
 }
 
-int shot_png(const char *path, const uint8_t *bgra, int width, int height) {
+int shot_png(const char *path, const uint8_t *bgra, int width, int height, int source_encoding) {
     int stream = strcmp(path, "-") == 0;
     int fd = stream ? dup(STDOUT_FILENO) : open(path, O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC, 0600);
     if (fd < 0) { perror(path); return -1; }
-    FILE *file = fdopen(fd, "wb");
-    if (!file) { close(fd); if (!stream) unlink(path); return -1; }
-    png_image image = {0};
-    image.version = PNG_IMAGE_VERSION;
-    image.width = width;
-    image.height = height;
-    image.format = PNG_FORMAT_BGRA;
-    int ok = png_image_write_to_stdio(&image, file, 0, bgra, width*4, NULL);
-    if (!ok) fprintf(stderr, "ouroshot: PNG: %s\n", image.message);
-    png_image_free(&image);
-    if (fclose(file)) ok = 0;
-    if (!ok && !stream) unlink(path);
-    return ok ? 0 : -1;
+    int result = shot_png_fd(fd, bgra, width, height, source_encoding);
+    if (result && !stream) unlink(path);
+    return result;
 }
 
 struct ShotDma {
@@ -147,6 +173,8 @@ struct ShotVideo {
     AVFrame *last;
     int fd, width, height, header;
     enum AVPixelFormat input_format;
+    int source_encoding;
+    uint8_t lut[256], *converted;
 };
 static int write_bytes(void *opaque, const uint8_t *buf, int size) {
     ShotVideo *v = opaque;
@@ -167,6 +195,7 @@ static int64_t seek_bytes(void *opaque, int64_t offset, int whence) {
 }
 static void destroy(ShotVideo *v) {
     if (!v) return;
+    free(v->converted);
     sws_freeContext(v->sws);
     av_frame_free(&v->frame);
     av_frame_free(&v->last);
@@ -219,7 +248,8 @@ static int hardware_setup(ShotVideo *v, const char *device, ShotDma *dma) {
     if (err<0 || avfilter_init_str(v->source,NULL)<0) return -1;
     AVFilterContext *convert=NULL;
     char args[256];
-    snprintf(args,sizeof(args),"w=%d:h=%d:format=nv12:out_color_matrix=bt709:out_range=limited:out_color_primaries=bt709:out_color_transfer=iec61966-2-1",v->width,v->height);
+    snprintf(args,sizeof(args),"w=%d:h=%d:format=nv12:out_color_matrix=bt709:out_range=limited%s",v->width,v->height,
+             v->source_encoding == SHOT_SOURCE_UNKNOWN ? "" : ":out_color_primaries=bt709:out_color_transfer=iec61966-2-1");
     if (avfilter_graph_create_filter(&convert,avfilter_get_by_name("scale_vaapi"),"convert",args,NULL,v->graph)<0 ||
         avfilter_graph_create_filter(&v->sink,avfilter_get_by_name("buffersink"),"encode",NULL,NULL,v->graph)<0 ||
         avfilter_link(v->source,0,convert,0)<0 || avfilter_link(convert,0,v->sink,0)<0 ||
@@ -228,18 +258,26 @@ static int hardware_setup(ShotVideo *v, const char *device, ShotDma *dma) {
 }
 
 ShotVideo *shot_video_open(const char *path, int width, int height, int fps,
-                          const char *encoder, const char *device, ShotDma *dma, int rgba) {
+                          const char *encoder, const char *device, ShotDma *dma, int rgba, int source_encoding) {
+    // VAAPI matrix conversion is not a gamma22 -> sRGB transfer conversion.
+    if (dma && source_encoding == SHOT_SOURCE_GAMMA22) return NULL;
     av_log_set_level(AV_LOG_WARNING);
     ShotVideo *v = calloc(1, sizeof(*v));
     if (!v) return NULL;
     v->fd = -1; v->width = width; v->height = height;
+    v->source_encoding = source_encoding;
+    if (source_encoding == SHOT_SOURCE_GAMMA22) {
+        gamma22_lut(v->lut);
+        v->converted = malloc((size_t)width * height * 4);
+        if (!v->converted) goto fail;
+    }
     v->input_format=rgba ? AV_PIX_FMT_RGB0 : AV_PIX_FMT_BGR0;
     int hardware=strcmp(encoder,"software")!=0;
     if (hardware && hardware_setup(v,device,dma)<0) {
         destroy(v);
         if (strcmp(encoder,"auto")!=0 || dma) return NULL;
         fprintf(stderr,"ouroshot: VAAPI unavailable; using software encoding\n");
-        return shot_video_open(path,width,height,fps,"software",device,NULL,rgba);
+        return shot_video_open(path,width,height,fps,"software",device,NULL,rgba,source_encoding);
     }
     const AVCodec *codec = avcodec_find_encoder_by_name(hardware ? "h264_vaapi" : "libx264");
     if (!codec || avformat_alloc_output_context2(&v->format, NULL, NULL, path) < 0) goto fail;
@@ -256,8 +294,8 @@ ShotVideo *shot_video_open(const char *path, int width, int height, int fps,
     v->codec->max_b_frames = 0;
     v->codec->color_range = AVCOL_RANGE_MPEG;
     v->codec->colorspace = AVCOL_SPC_BT709;
-    v->codec->color_primaries = AVCOL_PRI_BT709;
-    v->codec->color_trc = AVCOL_TRC_IEC61966_2_1;
+    v->codec->color_primaries = source_encoding == SHOT_SOURCE_UNKNOWN ? AVCOL_PRI_UNSPECIFIED : AVCOL_PRI_BT709;
+    v->codec->color_trc = source_encoding == SHOT_SOURCE_UNKNOWN ? AVCOL_TRC_UNSPECIFIED : AVCOL_TRC_IEC61966_2_1;
     if (v->format->oformat->flags & AVFMT_GLOBALHEADER) v->codec->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
     if (hardware) {
         av_opt_set(v->codec->priv_data,"rc_mode","CQP",0);
@@ -271,7 +309,7 @@ ShotVideo *shot_video_open(const char *path, int width, int height, int fps,
         if (hardware && !dma && strcmp(encoder,"auto")==0) {
             destroy(v);
             fprintf(stderr,"ouroshot: hardware encoder unavailable; using software encoding\n");
-            return shot_video_open(path,width,height,fps,"software",device,NULL,rgba);
+            return shot_video_open(path,width,height,fps,"software",device,NULL,rgba,source_encoding);
         }
         goto fail;
     }
@@ -326,8 +364,8 @@ static int hardware_frame(ShotVideo *v, AVFrame *input, int64_t pts_us) {
     input->pts=pts_us;
     input->color_range=AVCOL_RANGE_JPEG;
     input->colorspace=AVCOL_SPC_RGB;
-    input->color_primaries=AVCOL_PRI_BT709;
-    input->color_trc=AVCOL_TRC_IEC61966_2_1;
+    input->color_primaries=v->codec->color_primaries;
+    input->color_trc=v->codec->color_trc;
     if (av_buffersrc_write_frame(v->source,input)<0) return -1;
     av_frame_unref(v->frame);
     if (av_buffersink_get_frame(v->sink,v->frame)<0) return -1;
@@ -344,6 +382,10 @@ static int hardware_frame(ShotVideo *v, AVFrame *input, int64_t pts_us) {
 }
 int shot_video_repeat(ShotVideo *v, int64_t pts_us) {
     if (!v->last->buf[0]) return -1;
+    v->last->color_range=v->codec->color_range;
+    v->last->colorspace=v->codec->colorspace;
+    v->last->color_primaries=v->codec->color_primaries;
+    v->last->color_trc=v->codec->color_trc;
     v->last->pts=pts_us;
     v->last->duration=1000000/v->codec->framerate.num;
     if (avcodec_send_frame(v->codec,v->last)<0) return -1;
@@ -381,6 +423,12 @@ done:
     return result;
 }
 int shot_video_frame(ShotVideo *v, const uint8_t *bgra, int row_stride, int64_t pts_us) {
+    if (v->converted) {
+        for (int y = 0; y < v->height; y++)
+            convert_rgb(v->converted + (size_t)y * v->width * 4, bgra + (size_t)y * row_stride, v->width, v->lut);
+        bgra = v->converted;
+        row_stride = v->width * 4;
+    }
     if (v->device) {
         AVFrame *input=av_frame_alloc(), *uploaded=av_frame_alloc();
         int result=-1;

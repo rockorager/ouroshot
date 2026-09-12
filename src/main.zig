@@ -19,10 +19,12 @@ const help =
     \\  --encoder MODE       auto (default), software, or vaapi
     \\  --capture MODE       auto (default), shm, or dmabuf (recording)
     \\  --device PATH        DRM render node for hardware encoding/capture
+    \\  --source-encoding E  unknown (default), srgb, or gamma22 (sRGB primaries)
     \\  --list-outputs       Print logical output geometry
     \\  -h, --help           Print this help
     \\Existing files are never overwritten. Recording prefers ext-image-copy +
-    \\DMA-BUF/VAAPI, with SHM/software fallback. No audio. PNG retains original pixels.
+    \\DMA-BUF/VAAPI, with SHM/software fallback. gamma22 exports convert to sRGB
+    \\and require SHM recording. Unknown sources keep bytes without color claims.
     \\
 ;
 
@@ -40,6 +42,7 @@ const Options = struct {
     encoder: [:0]const u8 = "auto",
     capture: [:0]const u8 = "auto",
     device: [:0]const u8 = "",
+    source_encoding: c_int = c.SHOT_SOURCE_UNKNOWN,
 };
 
 fn write(text: []const u8) !void {
@@ -103,11 +106,17 @@ fn run(init: std.process.Init) !void {
             options.device = args[i];
             continue;
         }
+        if (std.mem.eql(u8, arg, "--source-encoding")) {
+            options.source_encoding = c.shot_source_encoding(args[i]);
+            if (options.source_encoding < 0) return error.InvalidSourceEncoding;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) options.output = args[i] else if (std.mem.eql(u8, arg, "-g") or std.mem.eql(u8, arg, "--geometry")) options.geometry = try Rect.parse(args[i]) else if (std.mem.eql(u8, arg, "--fps")) options.fps = try std.fmt.parseInt(u32, args[i], 10) else if (std.mem.eql(u8, arg, "--duration")) options.duration = try std.fmt.parseInt(u32, args[i], 10) else return error.UnknownOption;
     }
     if (!std.mem.eql(u8, options.encoder, "auto") and !std.mem.eql(u8, options.encoder, "software") and !std.mem.eql(u8, options.encoder, "vaapi")) return error.InvalidEncoder;
     if (!std.mem.eql(u8, options.capture, "auto") and !std.mem.eql(u8, options.capture, "shm") and !std.mem.eql(u8, options.capture, "dmabuf")) return error.InvalidCaptureMode;
     if (std.mem.eql(u8, options.capture, "dmabuf") and std.mem.eql(u8, options.encoder, "software")) return error.DmaRequiresHardwareEncoder;
+    if (options.source_encoding == c.SHOT_SOURCE_GAMMA22 and std.mem.eql(u8, options.capture, "dmabuf")) return error.Gamma22RequiresShmCapture;
     if (options.fps == 0 or options.fps > 120 or (options.duration != null and (options.duration.? == 0 or options.duration.? > 86400))) return error.InvalidRecordingRateOrDuration;
     if (options.geometry_only and (options.record or options.output != null)) return error.IncompatibleOptions;
     if (options.fullscreen and options.geometry != null) return error.IncompatibleOptions;
@@ -135,7 +144,7 @@ fn run(init: std.process.Init) !void {
         if (!frozen) _ = try app.capture(options.cursor, region);
         var image = try app.compose(region);
         defer image.deinit(allocator);
-        if (c.shot_png(path, image.data.ptr, @intCast(image.width), @intCast(image.height)) != 0) return error.PngWriteFailed;
+        if (c.shot_png(path, image.data.ptr, @intCast(image.width), @intCast(image.height), options.source_encoding) != 0) return error.PngWriteFailed;
     }
 }
 
@@ -145,10 +154,10 @@ fn record(app: *client.Client, region: Rect, path: [:0]const u8, options: Option
         if (c.shot_video_close(v) != 0) std.debug.print("ouroshot: could not finalize partial recording\n", .{});
     };
     const strict_dma = std.mem.eql(u8, options.capture, "dmabuf");
-    if (!std.mem.eql(u8, options.capture, "shm") and !std.mem.eql(u8, options.encoder, "software")) {
+    if (options.source_encoding != c.SHOT_SOURCE_GAMMA22 and !std.mem.eql(u8, options.capture, "shm") and !std.mem.eql(u8, options.encoder, "software")) {
         if (try app.startCapture(region, options.cursor, options.device, true)) {
             const crop = app.dma.crop;
-            video = c.shot_video_open(path, @intCast(crop.width), @intCast(crop.height), @intCast(options.fps), options.encoder, options.device, app.dma.storage, 0);
+            video = c.shot_video_open(path, @intCast(crop.width), @intCast(crop.height), @intCast(options.fps), options.encoder, options.device, app.dma.storage, 0, options.source_encoding);
             if (video == null) try app.stopDma();
         }
         if (strict_dma and video == null) return error.DmaRecordingUnavailable;
@@ -199,7 +208,7 @@ fn record(app: *client.Client, region: Rect, path: [:0]const u8, options: Option
                 width = f.crop.width;
                 height = f.crop.height;
                 rgba = f.rgba;
-                video = c.shot_video_open(path, @intCast(width), @intCast(height), @intCast(options.fps), options.encoder, options.device, null, @intFromBool(rgba)) orelse return error.VideoOpenFailed;
+                video = c.shot_video_open(path, @intCast(width), @intCast(height), @intCast(options.fps), options.encoder, options.device, null, @intFromBool(rgba), options.source_encoding) orelse return error.VideoOpenFailed;
             }
             if (width != f.crop.width or height != f.crop.height or rgba != f.rgba) return error.OutputChanged;
             const result = if (f.dma) |dma| c.shot_video_dma_frame(video.?, dma, f.crop.x, f.crop.y, pts) else c.shot_video_frame(video.?, f.data.?, @intCast(f.stride), pts);

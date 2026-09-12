@@ -90,6 +90,7 @@ const Service = struct {
     capture_path: []const u8,
     environ: std.process.Environ,
     timeout_ns: i64,
+    source_encoding: c_int,
 
     fn cancel(self: *Service) void {
         if (self.worker) |worker| {
@@ -218,7 +219,7 @@ const Service = struct {
             for (&self.connections) |connection| if (connection.fd >= 0) {
                 _ = c.close(connection.fd);
             };
-            const color = capture(self.environ, screenshot, image_fd, arguments) catch |err| {
+            const color = capture(self.environ, screenshot, image_fd, arguments, self.source_encoding) catch |err| {
                 std.debug.print("ouroshot-service: capture: {s}\n", .{@errorName(err)});
                 writeAll(pipe[1], if (err == error.Cancelled) "C" else "F") catch {};
                 c._exit(0);
@@ -410,7 +411,7 @@ const Service = struct {
     }
 };
 
-fn capture(environ: std.process.Environ, screenshot: bool, image_fd: c_int, arguments: mcp.Parameters) ![3]f64 {
+fn capture(environ: std.process.Environ, screenshot: bool, image_fd: c_int, arguments: mcp.Parameters, source_encoding: c_int) ![3]f64 {
     if (fixture) {
         // Only in the separately named test binary, never in ouroshot-service.
         // stdin is a deterministic UI gate: S=accept, C=cancel, F=fail.
@@ -418,7 +419,7 @@ fn capture(environ: std.process.Environ, screenshot: bool, image_fd: c_int, argu
         if (c.read(0, &gate, 1) != 1) return error.FixtureClosed;
         if (gate == 'C') return error.Cancelled;
         if (gate != 'S') return error.FixtureFailed;
-        if (screenshot and c.shot_png_fd(image_fd, &[_]u8{ 51, 102, 204, 255, 17, 34, 68, 255 }, 2, 1) != 0) return error.PngWriteFailed;
+        if (screenshot and c.shot_png_fd(image_fd, &[_]u8{ 51, 102, 204, 255, 17, 34, 68, 255 }, 2, 1, source_encoding) != 0) return error.PngWriteFailed;
         return .{ 0.8, 0.4, 0.2 };
     }
     if (!screenshot) return error.CaptureUnavailable;
@@ -431,7 +432,7 @@ fn capture(environ: std.process.Environ, screenshot: bool, image_fd: c_int, argu
     const region = try app.select(true, preset);
     var image = try app.compose(region);
     defer image.deinit(allocator);
-    if (c.shot_png_fd(image_fd, image.data.ptr, @intCast(image.width), @intCast(image.height)) != 0) return error.PngWriteFailed;
+    if (c.shot_png_fd(image_fd, image.data.ptr, @intCast(image.width), @intCast(image.height), source_encoding) != 0) return error.PngWriteFailed;
     return .{ 0, 0, 0 };
 }
 
@@ -480,15 +481,22 @@ fn run(init: std.process.Init) !void {
     _ = c.umask(0o077);
     var idle_ms: i64 = 30_000;
     var timeout_ms: i64 = 300_000;
+    var source_encoding: c_int = c.SHOT_SOURCE_UNKNOWN;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--help")) return writeAll(1, "ouroshot-service [--idle-ms N] [--timeout-ms N] [--export-mcp-descriptor]\nMCP socket: $XDG_RUNTIME_DIR/ouro/capture.mcp.sock, or systemd LISTEN_FDS=1.\nScreenshot uses the existing region selector. PickColor is not yet available.\n");
+        if (std.mem.eql(u8, args[i], "--help")) return writeAll(1, "ouroshot-service [--idle-ms N] [--timeout-ms N] [--export-mcp-descriptor]\n  [--source-encoding unknown|srgb|gamma22] (default unknown; known sRGB primaries)\nMCP socket: $XDG_RUNTIME_DIR/ouro/capture.mcp.sock, or systemd LISTEN_FDS=1.\nScreenshot uses the existing region selector. PickColor is not yet available.\n");
         if (std.mem.eql(u8, args[i], "--export-mcp-descriptor")) {
             try writeAll(1, try mcp.descriptor(init.arena.allocator()));
             return writeAll(1, "\n");
         }
         if (i + 1 >= args.len) return error.UnknownOption;
+        if (std.mem.eql(u8, args[i], "--source-encoding")) {
+            source_encoding = c.shot_source_encoding(args[i + 1]);
+            if (source_encoding < 0) return error.InvalidSourceEncoding;
+            i += 1;
+            continue;
+        }
         if (std.mem.eql(u8, args[i], "--idle-ms")) idle_ms = try std.fmt.parseInt(i64, args[i + 1], 10) else if (std.mem.eql(u8, args[i], "--timeout-ms")) timeout_ms = try std.fmt.parseInt(i64, args[i + 1], 10) else return error.UnknownOption;
         i += 1;
     }
@@ -541,7 +549,7 @@ fn run(init: std.process.Init) !void {
     defer allocator.free(capture_path);
     const service = try allocator.create(Service);
     defer allocator.destroy(service);
-    service.* = .{ .listener = listener, .directory = directory, .capture_path = capture_path, .environ = init.minimal.environ, .timeout_ns = timeout_ms * 1_000_000 };
+    service.* = .{ .listener = listener, .directory = directory, .capture_path = capture_path, .environ = init.minimal.environ, .timeout_ns = timeout_ms * 1_000_000, .source_encoding = source_encoding };
     defer for (0..service.connections.len) |index| service.close(index);
     try service.loop(idle_ms * 1_000_000);
 }

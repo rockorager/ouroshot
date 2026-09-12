@@ -17,6 +17,7 @@ import time
 
 from PIL import Image, ImageChops, ImageDraw
 from pointer import Pointer, cursor_environment
+from encoding import chunks, expected_channel, check_video
 
 ROOT = Path(__file__).resolve().parents[1]
 EXE = Path(sys.argv[1] if len(sys.argv) > 1 else ROOT / "zig-out/bin/ouroshot").resolve()
@@ -81,6 +82,26 @@ try:
     pointer.move(10, 10)
     time.sleep(.1)
 
+    # Sway supplies deterministic raw bytes, not an Ouro encoding guarantee.
+    # Explicitly interpret those synthetic bytes under each source policy.
+    sway("output HEADLESS-1 bg #104080 solid_color")
+    time.sleep(.25)
+    for source in ("unknown", "srgb", "gamma22"):
+        color = tuple(map(expected_channel, (16, 64, 128))) if source == "gamma22" else (16, 64, 128)
+        for mode in ("full", "crop", "stdout"):
+            path = ART / f"encoding-{source}-{mode}.png"
+            target = ["--fullscreen"] if mode == "full" else ["-g", "3,5 100x80"]
+            result = run([EXE, "--source-encoding", source, *target, "-o", "-" if mode == "stdout" else path])
+            if mode == "stdout": path.write_bytes(result.stdout)
+            image = Image.open(path)
+            assert image.convert("RGB").getextrema() == tuple((c, c) for c in color)
+            assert (b"sRGB" in chunks(path)) == (source != "unknown")
+        path = ART / f"encoding-{source}.mp4"
+        result = run([EXE, "--source-encoding", source, "--record", "-g", "2,4 100x80", "--duration", "1", "-o", path])
+        if source == "gamma22": assert b"input=shm" in result.stderr
+        check_video(path, [(30, 30, color)], source != "unknown", 150, 120)
+    print("PASS explicit encoding policies: CLI full/crop/stdout PNG and decoded video metadata/pixels", flush=True)
+
     pattern = Image.new("RGB", (960, 600), "#172435")
     draw = ImageDraw.Draw(pattern)
     for y in range(0, 600, 40):
@@ -108,7 +129,7 @@ try:
     equal(baseline, Image.open(ART / "full.png"))
     print("PASS full/cropped/stdout PNG at 150%, existing-file protection", flush=True)
 
-    proc = launch("frozen", ["-o", ART / "selected.png"])
+    proc = launch("frozen", ["--source-encoding", "gamma22", "-o", ART / "selected.png"])
     time.sleep(.3)
     assert proc.poll() is None
     pointer.move(80, 60)
@@ -135,8 +156,9 @@ try:
     assert preview.getpixel((650, 450)) == tuple(v*3//5 for v in outside), (preview.getpixel((650, 450)), outside)
     pointer.button(0)
     assert proc.wait(timeout=5) == 0
-    equal(baseline.crop((120, 90, 450, 300)), Image.open(ART / "selected.png"))
-    print("PASS frozen pixels, fractional selection, shrinking redraw, clean saved crop", flush=True)
+    equal(baseline.crop((120, 90, 450, 300)).point([expected_channel(i) for i in range(256)] * 3), Image.open(ART / "selected.png"))
+    assert b"sRGB" in chunks(ART / "selected.png")
+    print("PASS raw frozen preview, gamma22 export, fractional selection, shrinking redraw, clean saved crop", flush=True)
 
     # Older Sway versions can place the second background below the first.
     # With the pointer grab over, set an unambiguous background for live tests.
@@ -164,7 +186,7 @@ try:
     assert proc.wait(timeout=5) == 130
     assert not (ART / "cancel.png").exists()
 
-    proc = launch("live", ["--live", "-o", ART / "live.png"])
+    proc = launch("live", ["--source-encoding", "gamma22", "--live", "-o", ART / "live.png"])
     time.sleep(.2)
     pointer.move(100, 80)
     time.sleep(.05)
@@ -178,7 +200,8 @@ try:
     pointer.button(0)
     assert proc.wait(timeout=5) == 0
     live = Image.open(ART / "live.png").convert("RGB")
-    assert live.getextrema() == ((128, 128), (32, 32), (16, 16)), live.getextrema()
+    assert live.getextrema() == tuple((expected_channel(c), expected_channel(c)) for c in (128, 32, 16)), live.getextrema()
+    assert b"sRGB" in chunks(ART / "live.png")
     print("PASS geometry-only reverse drag, cancellation, live overlay exclusion", flush=True)
 
     # Asymmetric patterned reference catches rotation/mirroring, not just sizes.

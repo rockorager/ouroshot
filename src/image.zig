@@ -35,6 +35,9 @@ pub const Image = struct {
     }
 
     // Transform the raw output buffer as described by wl_output.transform.
+    // Screenshots/previews are opaque. For premultiplied ARGB, retaining the
+    // associated RGB and setting alpha to 255 flattens against black in the
+    // source encoding. Export conversion happens only after this normalization.
     pub fn fromBuffer(allocator: std.mem.Allocator, bytes: []const u8, width: u32, height: u32, stride: u32, format: u32, y_invert: bool, transform: u32) !Image {
         if (transform > 7 or stride < @as(u64, width) * 4 or bytes.len < @as(u64, stride) * height) return error.InvalidBuffer;
         if (format != 0 and format != 1 and format != 0x34324241 and format != 0x34324258) return error.UnsupportedPixelFormat;
@@ -117,4 +120,15 @@ test "native crop includes partial edge pixels and preserves uneven output dimen
     try std.testing.expectEqual(@as(u32, 5), cropped.height);
     try std.testing.expectEqual([4]u8{ 5, 3, 91, 255 }, cropped.pixel(0, 0).*);
     try std.testing.expectEqual([4]u8{ 10, 7, 91, 255 }, cropped.pixel(5, 4).*);
+}
+
+test "capture alpha is flattened before export, not interpreted as straight RGB" {
+    const bytes = [_]u8{ 16, 32, 64, 128, 0, 0, 0, 0 };
+    for ([_]u32{ 0, 1, 0x34324241, 0x34324258 }) |format| {
+        var image = try Image.fromBuffer(std.testing.allocator, &bytes, 2, 1, 8, format, false, 0);
+        defer image.deinit(std.testing.allocator);
+        const rgb_swap = format == 0x34324241 or format == 0x34324258;
+        try std.testing.expectEqual(if (rgb_swap) [4]u8{ 64, 32, 16, 255 } else [4]u8{ 16, 32, 64, 255 }, image.pixel(0, 0).*);
+        try std.testing.expectEqual([4]u8{ 0, 0, 0, 255 }, image.pixel(1, 0).*);
+    }
 }

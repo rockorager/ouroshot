@@ -63,6 +63,53 @@ output geometry. Run from the target Wayland session or explicitly set its
 
 ## Capture and selection
 
+### Source encoding
+
+Both executables accept `--source-encoding unknown|srgb|gamma22`. The default
+is **unknown**: PNG preserves raw RGB bytes without a color profile; video
+leaves transfer and primaries unspecified. This cannot promise color-accurate
+display in a viewer that guesses a color space for untagged content.
+
+Select **gamma22** for Ouro versions whose raw wlr-screencopy and
+ext-image-copy-capture outputs use SDR sRGB primaries and pure gamma 2.2:
+
+```sh
+ouroshot --source-encoding gamma22 -o screenshot.png
+ouroshot --source-encoding gamma22 --record -o recording.mp4
+ouroshot-service --source-encoding gamma22
+```
+
+For a socket-activated service, configure the same argument in its `ExecStart`
+(using a systemd user override). Configure CLI launchers separately. This is a
+desktop/operator choice, not an MCP request parameter. No compositor is
+auto-detected. Older Ouro or other compositor versions may need a different
+policy. Neither FourCC, protocol buffer parameters nor monitor HDR/ICC metadata
+establishes capture transfer or primaries. One selection applies to all outputs;
+mixed/unknown source encodings must use `unknown` or be captured separately.
+
+`gamma22` exports decode pure gamma 2.2 to linear light, then encode piecewise
+sRGB. PNG carries an `sRGB` chunk; video declares IEC 61966-2-1 transfer and
+BT.709 primaries. This matches sRGB PNG consumers and the existing video output
+contract rather than relying on support for a custom gamma profile. `srgb`
+declares the same metadata without transfer conversion; it requires known sRGB
+primaries **and piecewise sRGB** source bytes. Unknown video still uses and
+declares BT.709 YUV matrix coefficients and limited range, but those do not
+claim knowledge of the source transfer/primaries.
+
+Conversion affects exports only. Frozen previews keep raw capture bytes for
+untagged redisplay (so Ouro gamma22 capture channel 16 stays 16 in the preview,
+but becomes approximately sRGB 7 in a tagged export). Live selection is also
+unchanged. Capture remains opaque: premultiplied ARGB is flattened against black
+in the source encoding before export, not mistaken for straight-alpha RGB.
+PNG's straight alpha is never transfer-converted.
+
+Gamma22 recording requires SHM: auto capture skips DMA-BUF, while explicit
+`--capture dmabuf` fails. SHM conversion runs on the CPU before software encoding
+or VAAPI upload; VAAPI's RGB/YUV matrix conversion alone is not a transfer
+conversion. PNG compression is lossless, but 8-bit gamma22-to-sRGB re-encoding
+quantizes channel values (some near-black codes merge); raw byte preservation
+requires `unknown` and leaves interpretation to the consumer.
+
 Screenshots and compatibility recording use **wlr-screencopy**. Single-output,
 untransformed recording prefers **ext-image-copy-capture-v1**, with either SHM
 or DMA-BUF buffers. Interactive selection also needs
@@ -107,7 +154,7 @@ Recording records live frames, not the frozen selector image. Defaults are
 
 VAAPI uses H.264 CQP 20; software uses CRF 18, `veryfast`, two encoder threads.
 These are different quality controls, not quality-equivalent settings. Video
-is lossy 8-bit YUV420 SDR; PNG is the lossless path. Odd dimensions fall back to
+is lossy 8-bit YUV420 SDR; PNG avoids video compression losses. Odd dimensions fall back to
 software and are padded to even dimensions on the right/bottom, not rescaled.
 There is no audio.
 
@@ -136,9 +183,8 @@ Current limitations:
 - Ext capture buffers cover the output even for small crops; the compositor
   may optimize their updates using damage. The encoder only converts the crop.
 - No audio or PipeWire ScreenCast portal. No promise of 4K/120 Hz recording.
-- 8-bit SDR capture only; no HDR conversion or ICC profile embedding. Captured
-  bytes are used as supplied by the compositor; video conversion assumes sRGB
-  primaries/transfer and BT.709 YUV coefficients.
+- 8-bit SDR capture only; no HDR conversion or ICC profile embedding. Source
+  encoding must be selected explicitly for color-accurate export; see above.
 - No promise of seamless output hotplug or layout changes during selection or
   recording. Restart capture after changing the output layout.
 
@@ -262,7 +308,9 @@ picker must supply reliable source metadata/conversion or an explicit native
 desktop guarantee. The former `--capture-source-srgb` option is removed along
 with the picker; no request parameter can enable color picking.
 
-The retained artifact writer does not falsely attach an sRGB/gamma profile.
+The retained artifact writer leaves unknown captures untagged. With an explicit
+known source encoding it writes the same tagged sRGB PNG as the CLI, converting
+gamma22 pixels first. A caller cannot override the daemon's encoding policy.
 An unnamed 0600 PNG is written and closed by the worker; only then is it atomically
 linked under a random name in the user-owned 0700 `ouro/captures` directory.
 No destination is overwritten and no caller supplies an output path. Successful
@@ -297,6 +345,7 @@ PY
 ```sh
 zig build test
 zig build -Dservice-test-fixture=true
+python3 test/encoding.py
 python3 test/service.py
 python3 test/service_unavailable.py
 python3 test/service_wayland.py
@@ -315,6 +364,14 @@ The production binary has no fixture or confirmation-bypass option. Transport
 tests use real Unix sockets, real worker processes, and inherited listening fds;
 they cover framing/type errors, Busy, cancellation of pending work, late results,
 PNG modes/URI encoding, and idle exit/reactivation with retained results.
+
+`test/encoding.py` compiles the real C encoder as a temporary shared library and
+checks PNG chunks/CRC and all channel codes, straight alpha, RGB/BGR padded video
+input, decoded pixels and stream/frame color metadata, cached frames, service
+artifact policies, and invalid source/DMA options. Its independent inverse-sRGB
+quantization reference distinguishes gamma22 channel 16 → sRGB 7 → gamma22 16.
+The CLI and production service Wayland tests also exercise gamma22 export while
+asserting that live/frozen preview pixels remain in the original encoding.
 
 The unavailable-method test verifies PickColor fails regardless of caller hints,
 without a worker, image, or attempted Wayland connection. The Wayland test checks

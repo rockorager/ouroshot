@@ -23,6 +23,8 @@ lib.shot_video_close.argtypes = [C.c_void_p]
 if mode != "baseline":
     lib.shot_video_open.argtypes += [C.c_char_p, C.c_char_p, C.c_void_p, C.c_int]
     lib.shot_video_frame.argtypes = [C.c_void_p, C.c_void_p, C.c_int, C.c_int64]
+    if hasattr(lib, "shot_source_encoding"):
+        lib.shot_video_open.argtypes += [C.c_int]
 frames = []
 for i in range(8):
     image = Image.new("RGB", (width, height))
@@ -34,6 +36,7 @@ for i in range(8):
     frames.append(C.create_string_buffer(image.tobytes("raw", "BGRX")))
 args = [output.encode(), width, height, 60]
 if mode != "baseline": args += [mode.encode(), b"/dev/dri/renderD128", None, 0]
+if mode != "baseline" and hasattr(lib, "shot_source_encoding"): args += [1]  # synthetic sRGB
 video = lib.shot_video_open(*args)
 assert video, "encoder initialization failed"
 usage = resource.getrusage(resource.RUSAGE_SELF)
